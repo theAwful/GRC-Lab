@@ -1,0 +1,7 @@
+---
+- import_playbook: common-windows.yml
+- import_playbook: domain-controllers.yml
+- import_playbook: member-servers.yml
+- import_playbook: workstations.yml
+- import_playbook: misconfigurations.yml
+- import_playbook: audit-box.yml
