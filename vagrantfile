@@ -1,0 +1,62 @@
+DOMAIN        = "corp.grclab.local"
+DC_PRIMARY_IP = "10.10.10.10"
+SWITCH_NAME   = "GRC-Lab-Switch"
+
+MACHINES = [
+  { name: "DC-PRIMARY",          box: "gusztavvargadr/windows-server-2022-standard", ip: "10.10.10.10", ram: 4096, cpus: 2 },
+  { name: "DC-SECONDARY",        box: "gusztavvargadr/windows-server-2022-standard", ip: "10.10.10.11", ram: 4096, cpus: 2 },
+  { name: "MEMBER-SERVER-01",    box: "gusztavvargadr/windows-server-2019-standard", ip: "10.10.10.20", ram: 4096, cpus: 2 },
+  { name: "MEMBER-SERVER-02",    box: "gusztavvargadr/windows-server-2019-standard", ip: "10.10.10.21", ram: 4096, cpus: 2 },
+  { name: "WORKSTATION-WIN10-01",box: "gusztavvargadr/windows-10-enterprise",        ip: "10.10.10.31", ram: 4096, cpus: 2 },
+  { name: "WORKSTATION-WIN10-02",box: "gusztavvargadr/windows-10-enterprise",        ip: "10.10.10.32", ram: 4096, cpus: 2 },
+  { name: "WORKSTATION-WIN11",   box: "gusztavvargadr/windows-11-enterprise",        ip: "10.10.10.33", ram: 4096, cpus: 2 },
+  { name: "AUDIT-BOX",           box: "kalilinux/rolling",                           ip: "10.10.10.50", ram: 4096, cpus: 2 },
+].freeze
+
+Vagrant.configure("2") do |config|
+  config.vm.provider "hyperv" do |h|
+    h.enable_virtualization_extensions = true
+    h.linked_clone = true
+    h.vm_integration_services = { guest_service_interface: true }
+  end
+
+  MACHINES.each do |vm_cfg|
+    config.vm.define vm_cfg[:name] do |machine|
+      machine.vm.box      = vm_cfg[:box]
+      machine.vm.hostname = vm_cfg[:name].downcase
+      machine.vm.network  "private_network", ip: vm_cfg[:ip], bridge: SWITCH_NAME
+
+      machine.vm.provider "hyperv" do |h|
+        h.vmname    = vm_cfg[:name]
+        h.memory    = vm_cfg[:ram]
+        h.maxmemory = vm_cfg[:ram]
+        h.cpus      = vm_cfg[:cpus]
+      end
+
+      unless vm_cfg[:name] == "AUDIT-BOX"
+        machine.vm.communicator       = "winrm"
+        machine.winrm.username        = "vagrant"
+        machine.winrm.password        = "vagrant"
+        machine.winrm.transport       = :negotiate
+        machine.winrm.basic_auth_only = false
+        machine.winrm.timeout         = 300
+        machine.winrm.retry_limit     = 20
+      end
+
+      # Ansible runs from AUDIT-BOX against all others
+      if vm_cfg[:name] == "AUDIT-BOX"
+        machine.vm.provision "ansible" do |ansible|
+          ansible.playbook       = "ansible/playbooks/site.yml"
+          ansible.inventory_path = "ansible/inventory.yml"
+          ansible.limit          = "all"
+          ansible.verbose        = "v"
+          ansible.extra_vars     = {
+            domain_name:             DOMAIN,
+            dc_primary_ip:           DC_PRIMARY_IP,
+            ansible_winrm_transport: "ntlm"
+          }
+        end
+      end
+    end
+  end
+end
