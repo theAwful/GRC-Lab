@@ -1,0 +1,43 @@
+---
+- name: MC-004 – Enable SMBv1 on File Server
+  hosts: member-server-01
+  gather_facts: no
+  tasks:
+    - name: Enable SMBv1 and disable signing
+      when: mc_004_smbv1_enabled | default(false)
+      ansible.windows.win_powershell:
+        script: |
+          Set-SmbServerConfiguration -EnableSMB1Protocol $true -Force
+          Set-SmbServerConfiguration -RequireSecuritySignature $false -Force
+
+- name: MC-005 – Disable Audit Policy on DCs
+  hosts: domain_controllers
+  gather_facts: no
+  tasks:
+    - name: Set audit subcategories to No Auditing
+      when: mc_005_audit_policy_disabled | default(false)
+      ansible.windows.win_powershell:
+        script: |
+          auditpol /set /subcategory:"Logon" /success:disable /failure:disable
+          auditpol /set /subcategory:"Account Logon" /success:disable /failure:disable
+          auditpol /set /subcategory:"Privilege Use" /success:disable /failure:disable
+          auditpol /set /subcategory:"Policy Change" /success:disable /failure:disable
+
+- name: MC-007 – Allow Null Sessions on DC-Secondary
+  hosts: dc-secondary
+  gather_facts: no
+  tasks:
+    - name: Set RestrictAnonymous = 0
+      when: mc_007_null_sessions | default(false)
+      ansible.windows.win_regedit:
+        path: HKLM:\SYSTEM\CurrentControlSet\Control\Lsa
+        name: RestrictAnonymous
+        data: 0
+        type: dword
+    - name: Allow anonymous SAM enumeration
+      when: mc_007_null_sessions | default(false)
+      ansible.windows.win_regedit:
+        path: HKLM:\SYSTEM\CurrentControlSet\Control\Lsa
+        name: RestrictAnonymousSAM
+        data: 0
+        type: dword
