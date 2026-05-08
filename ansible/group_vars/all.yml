@@ -1,0 +1,49 @@
+---
+# ─── Domain ───────────────────────────────────────────────────────────────────
+domain_name:        corp.grclab.local
+domain_netbios:     GRCLAB
+domain_admin_user:  Administrator
+domain_admin_pass:  "GrcL@b2024!"   # Change before deploying
+dc_primary_ip:      10.10.10.10
+dc_secondary_ip:    10.10.10.11
+
+# ─── Network ──────────────────────────────────────────────────────────────────
+dns_servers:
+  - 10.10.10.10
+  - 10.10.10.11
+
+# ─── OU Paths ─────────────────────────────────────────────────────────────────
+ou_servers:       "OU=Servers,DC=corp,DC=grclab,DC=local"
+ou_workstations:  "OU=Workstations,DC=corp,DC=grclab,DC=local"
+ou_users:         "OU=Users,DC=corp,DC=grclab,DC=local"
+ou_service_accts: "OU=ServiceAccounts,DC=corp,DC=grclab,DC=local"
+ou_groups:        "OU=Groups,DC=corp,DC=grclab,DC=local"
+
+# ─── Misconfiguration Flags – set false to disable a finding ──────────────────
+mc_001_weak_password_policy:     true
+mc_002_stale_accounts:           true
+mc_003_domain_users_local_admin: true
+mc_004_smbv1_enabled:            true
+mc_005_audit_policy_disabled:    true
+mc_007_null_sessions:            true
+mc_009_svc_noexpire:             true
+
+# ─── Test Users ───────────────────────────────────────────────────────────────
+test_users:
+  - { name: john.smith,    dept: IT,      title: "IT Manager",   admin: true  }
+  - { name: jane.doe,      dept: Finance, title: "Accountant",   admin: false }
+  - { name: bob.jones,     dept: HR,      title: "HR Manager",   admin: false }
+  - { name: alice.wu,      dept: IT,      title: "Sys Admin",    admin: true  }
+  - { name: charlie.brown, dept: Sales,   title: "Sales Rep",    admin: false }
+
+service_accounts:
+  - { name: svc.sql,        desc: "SQL Server Service",  noexpire: true }
+  - { name: svc.backup,     desc: "Backup Service",      noexpire: true }
+  - { name: svc.iis,        desc: "IIS App Pool",        noexpire: true }
+  - { name: svc.monitoring, desc: "Monitoring Agent",    noexpire: true }
+
+stale_accounts:
+  - svc.legacy
+  - user.archive01
+  - user.archive02
+  - user.archive03
