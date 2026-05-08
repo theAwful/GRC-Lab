@@ -1,0 +1,79 @@
+---
+- name: Install AD DS role
+  ansible.windows.win_feature:
+    name: AD-Domain-Services
+    include_management_tools: yes
+    state: present
+
+- name: Promote to Primary DC (new forest)
+  microsoft.ad.domain:
+    dns_domain_name:     "{{ domain_name }}"
+    domain_netbios_name: "{{ domain_netbios }}"
+    safe_mode_password:  "{{ domain_admin_pass }}"
+    domain_mode:         Win2019
+    forest_mode:         Win2019
+    install_dns:         yes
+    reboot:              yes
+
+- name: Wait for AD services
+  ansible.windows.win_wait_for:
+    timeout: 120
+
+- name: Create OU structure
+  microsoft.ad.ou:
+    name:  "{{ item }}"
+    path:  "DC=corp,DC=grclab,DC=local"
+    state: present
+  loop:
+    - Servers
+    - Workstations
+    - Users
+    - ServiceAccounts
+    - Groups
+
+- name: Create standard test users
+  microsoft.ad.user:
+    name:     "{{ item.name }}"
+    password: "P@ssw0rd2024!"
+    path:     "{{ ou_users }}"
+    state:    present
+    enabled:  yes
+    password_never_expires: no
+    other_attributes:
+      department: "{{ item.dept }}"
+      title:      "{{ item.title }}"
+  loop: "{{ test_users }}"
+
+- name: Create service accounts (MC-009)
+  microsoft.ad.user:
+    name:                   "{{ item.name }}"
+    password:               "SvcP@ss2024!"
+    path:                   "{{ ou_service_accts }}"
+    state:                  present
+    enabled:                yes
+    password_never_expires: "{{ item.noexpire }}"
+    description:            "{{ item.desc }}"
+  loop: "{{ service_accounts }}"
+  when: mc_009_svc_noexpire
+
+- name: Create stale accounts (MC-002)
+  microsoft.ad.user:
+    name:     "{{ item }}"
+    password: "OldP@ss123"
+    path:     "{{ ou_users }}"
+    state:    present
+    enabled:  yes
+  loop: "{{ stale_accounts }}"
+  when: mc_002_stale_accounts
+
+- name: MC-001 – Apply weak domain password policy
+  when: mc_001_weak_password_policy
+  ansible.windows.win_powershell:
+    script: |
+      Set-ADDefaultDomainPasswordPolicy -Identity "corp.grclab.local" `
+        -MinPasswordLength 8 `
+        -PasswordHistoryCount 5 `
+        -MaxPasswordAge (New-TimeSpan -Days 180) `
+        -MinPasswordAge (New-TimeSpan -Days 0) `
+        -ComplexityEnabled $false `
+        -ReversibleEncryptionEnabled $false
