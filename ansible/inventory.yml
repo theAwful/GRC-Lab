@@ -1,0 +1,54 @@
+---
+all:
+  vars:
+    ansible_user: vagrant
+    ansible_password: vagrant
+    ansible_connection: winrm
+    ansible_winrm_transport: ntlm
+    ansible_winrm_server_cert_validation: ignore
+    ansible_winrm_port: 5985
+    ansible_winrm_scheme: http
+
+  children:
+    domain_controllers:
+      vars:
+        is_domain_controller: true
+      hosts:
+        dc-primary:
+          ansible_host: 10.10.10.10
+          dc_role: primary
+          fsmo_holder: true
+        dc-secondary:
+          ansible_host: 10.10.10.11
+          dc_role: secondary
+          fsmo_holder: false
+
+    member_servers:
+      hosts:
+        member-server-01:
+          ansible_host: 10.10.10.20
+          server_role: fileserver
+        member-server-02:
+          ansible_host: 10.10.10.21
+          server_role: webserver
+
+    workstations:
+      hosts:
+        workstation-win10-01:
+          ansible_host: 10.10.10.31
+          os_version: win10
+        workstation-win10-02:
+          ansible_host: 10.10.10.32
+          os_version: win10
+          mc_006_guest_enabled: true   # Intentional finding
+        workstation-win11:
+          ansible_host: 10.10.10.33
+          os_version: win11
+
+    audit:
+      vars:
+        ansible_connection: ssh
+        ansible_user: vagrant
+      hosts:
+        audit-box:
+          ansible_host: 10.10.10.50
