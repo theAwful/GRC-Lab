@@ -1,0 +1,31 @@
+---
+- name: Set DNS to domain controllers
+  ansible.windows.win_powershell:
+    script: |
+      $a = Get-NetAdapter | Where-Object {$_.Status -eq "Up"} | Select-Object -First 1
+      Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex `
+        -ServerAddresses ("{{ dc_primary_ip }}", "{{ dc_secondary_ip }}")
+
+- name: Join workstation to domain
+  microsoft.ad.membership:
+    dns_domain_name:       "{{ domain_name }}"
+    domain_admin_user:     "{{ domain_netbios }}\\{{ domain_admin_user }}"
+    domain_admin_password: "{{ domain_admin_pass }}"
+    ou_path:               "{{ ou_workstations }}"
+    state:                 domain
+    reboot:                yes
+
+- name: MC-003 – Add Domain Users to local Administrators
+  when: mc_003_domain_users_local_admin | default(false)
+  ansible.windows.win_group_membership:
+    name:    Administrators
+    members:
+      - "{{ domain_netbios }}\\Domain Users"
+    state:   present
+
+- name: MC-006 – Enable Guest account
+  when: mc_006_guest_enabled | default(false)
+  ansible.windows.win_user:
+    name:             Guest
+    state:            present
+    account_disabled: no
