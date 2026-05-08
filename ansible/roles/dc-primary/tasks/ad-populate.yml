@@ -1,0 +1,45 @@
+---
+# ansible/roles/dc-primary/tasks/populate-ad.yml
+# Called from main.yml after domain promotion is complete.
+# Copies and executes Invoke-ADLabPopulate.ps1 on the primary DC.
+
+- name: Check if AD population has already run
+  ansible.windows.win_stat:
+    path: C:\Windows\Temp\ad-populated.flag
+  register: pop_flag
+
+- name: Copy AD population script to DC
+  ansible.windows.win_copy:
+    src:  "{{ playbook_dir }}/../scripts/setup/Invoke-ADLabPopulate.ps1"
+    dest: C:\Windows\Temp\Invoke-ADLabPopulate.ps1
+  when: not pop_flag.stat.exists
+
+- name: Run AD population script
+  ansible.windows.win_powershell:
+    script: |
+      C:\Windows\Temp\Invoke-ADLabPopulate.ps1 `
+        -DomainName "{{ domain_name }}" `
+        -DomainNetBIOS "{{ domain_netbios }}" `
+        -DefaultPassword "{{ domain_admin_pass }}" `
+        {{ '-SeedMisconfigurations' if seed_misconfigurations | default(true) else '' }}
+    error_action: stop
+  register: ad_pop_result
+  when: not pop_flag.stat.exists
+  timeout: 900   # 15-minute max – large AD build takes time
+
+- name: Show population output
+  debug:
+    var: ad_pop_result.output
+  when:
+    - not pop_flag.stat.exists
+    - ad_pop_result is defined
+
+- name: Write populated flag file
+  ansible.windows.win_copy:
+    content: "AD populated at {{ ansible_date_time.iso8601 }}"
+    dest:    C:\Windows\Temp\ad-populated.flag
+  when: not pop_flag.stat.exists
+
+- name: Confirm population complete
+  debug:
+    msg: "AD population complete – {{ domain_name }} has users, groups, computers, GPOs, and PSOs."
