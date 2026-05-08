@@ -1,0 +1,30 @@
+---
+- name: Install AD DS role
+  ansible.windows.win_feature:
+    name: AD-Domain-Services
+    include_management_tools: yes
+    state: present
+
+- name: Point DNS at primary DC
+  ansible.windows.win_powershell:
+    script: |
+      $a = Get-NetAdapter | Where-Object {$_.Status -eq "Up"} | Select-Object -First 1
+      Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex `
+        -ServerAddresses ("{{ dc_primary_ip }}", "127.0.0.1")
+
+- name: Promote to Additional Domain Controller
+  microsoft.ad.domain_controller:
+    dns_domain_name:       "{{ domain_name }}"
+    domain_admin_user:     "{{ domain_netbios }}\\{{ domain_admin_user }}"
+    domain_admin_password: "{{ domain_admin_pass }}"
+    safe_mode_password:    "{{ domain_admin_pass }}"
+    reboot:                yes
+
+- name: Verify AD replication
+  ansible.windows.win_powershell:
+    script: repadmin /replsummary
+  register: repl_status
+
+- name: Show replication summary
+  debug:
+    var: repl_status.stdout_lines
