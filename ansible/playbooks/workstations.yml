@@ -1,0 +1,288 @@
+---
+# =============================================================================
+# GRC Hyper-V Lab – Workstations Playbook
+# WORKSTATION-WIN10-01: 10.10.10.31
+# WORKSTATION-WIN10-02: 10.10.10.32  (MC-006: Guest enabled)
+# WORKSTATION-WIN11:    10.10.10.33
+# All three: MC-003 – Domain Users in local Administrators
+# =============================================================================
+
+- name: "[WORKSTATIONS] Apply common baseline"
+  hosts: workstations
+  gather_facts: no
+  vars:
+    ansible_winrm_operation_timeout_sec: 120
+    ansible_winrm_read_timeout_sec: 150
+
+  pre_tasks:
+    - name: Wait for WinRM
+      ansible.windows.win_wait_for:
+        host: "{{ ansible_host }}"
+        port: 5985
+        timeout: 300
+        delay: 10
+
+    - name: Confirm connectivity
+      ansible.windows.win_ping:
+
+    - name: Set static DNS to domain controllers
+      ansible.windows.win_powershell:
+        script: |
+          $adapters = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' }
+          foreach ($a in $adapters) {
+            Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex `
+              -ServerAddresses @("{{ dc_primary_ip }}", "{{ dc_secondary_ip }}")
+          }
+          Clear-DnsClientCache
+          Write-Output "DNS set to {{ dc_primary_ip }} / {{ dc_secondary_ip }}"
+
+  roles:
+    - common
+    - workstation
+
+
+# =============================================================================
+# All workstations: domain join and base configuration
+# =============================================================================
+- name: "[WORKSTATIONS] Common post-join configuration"
+  hosts: workstations
+  gather_facts: no
+
+  tasks:
+    - name: Disable Windows Update auto-install (lab stability)
+      ansible.windows.win_regedit:
+        path: HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU
+        name: NoAutoUpdate
+        data: 1
+        type: dword
+
+    - name: Disable Windows Update service (lab stability)
+      ansible.windows.win_service:
+        name: wuauserv
+        start_mode: disabled
+        state: stopped
+
+    - name: Set power plan to High Performance
+      ansible.windows.win_powershell:
+        script: |
+          powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
+          Write-Output "Power plan set to High Performance."
+
+    - name: Disable screensaver via registry (lab usability)
+      ansible.windows.win_regedit:
+        path: HKCU:\Control Panel\Desktop
+        name: ScreenSaveActive
+        data: "0"
+        type: string
+
+    - name: Enable Remote Desktop
+      ansible.windows.win_powershell:
+        script: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' -Value 0
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
+          Write-Output "Remote Desktop enabled."
+
+    - name: Ensure local Administrator account exists and is enabled
+      ansible.windows.win_user:
+        name: Administrator
+        state: present
+        account_disabled: no
+        password: "{{ local_admin_pass | default('L0calAdm!n2024') }}"
+
+    - name: Install common lab tools via winget/choco (non-blocking)
+      ansible.windows.win_powershell:
+        script: |
+          # Install Chocolatey if not present
+          if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
+            Set-ExecutionPolicy Bypass -Scope Process -Force
+            [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+            Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+          }
+          # Install audit-useful tools
+          choco install notepadplusplus 7zip -y --no-progress 2>&1 | Out-Null
+          Write-Output "Tools installed."
+        error_action: continue
+      ignore_errors: yes
+
+
+# =============================================================================
+# WIN10-01 & WIN10-02: Apply MC-003 – Domain Users in local Admins
+# =============================================================================
+- name: "[WIN10-01 / WIN10-02] Seed MC-003: Domain Users in local Administrators"
+  hosts: workstation-win10-01, workstation-win10-02
+  gather_facts: no
+
+  tasks:
+    - name: "MC-003 – Add Domain Users to local Administrators group"
+      ansible.windows.win_group_membership:
+        name: Administrators
+        members:
+          - "{{ domain_netbios }}\\Domain Users"
+        state: present
+      when: mc_003_domain_users_local_admin | default(true)
+      register: mc003_result
+
+    - name: "MC-003 – Log finding"
+      debug:
+        msg: "FINDING SEEDED: Domain Users added to local Administrators on {{ inventory_hostname }}"
+      when:
+        - mc_003_domain_users_local_admin | default(true)
+        - mc003_result.changed
+
+
+# =============================================================================
+# WIN10-02 only: MC-006 – Enable Guest account
+# =============================================================================
+- name: "[WIN10-02] Seed MC-006: Enable Guest account"
+  hosts: workstation-win10-02
+  gather_facts: no
+
+  tasks:
+    - name: "MC-006 – Enable built-in Guest account"
+      ansible.windows.win_user:
+        name: Guest
+        state: present
+        account_disabled: no
+      when: mc_006_guest_enabled | default(true)
+      register: mc006_result
+
+    - name: "MC-006 – Log finding"
+      debug:
+        msg: "FINDING SEEDED: Guest account enabled on WORKSTATION-WIN10-02"
+      when:
+        - mc_006_guest_enabled | default(true)
+        - mc006_result.changed
+
+    - name: "MC-006 – Set Guest password to blank (worsens finding)"
+      ansible.windows.win_powershell:
+        script: |
+          $guest = [ADSI]"WinNT://./Guest"
+          $guest.SetPassword("")
+          $guest.SetInfo()
+          Write-Output "Guest account set to blank password."
+      when: mc_006_guest_enabled | default(true)
+      ignore_errors: yes
+
+
+# =============================================================================
+# WIN10-01 only: MC-010/011 – Missing patches simulation
+# =============================================================================
+- name: "[WIN10-01] Simulate missing patches / older state"
+  hosts: workstation-win10-01
+  gather_facts: no
+
+  tasks:
+    - name: "MC-011 – Write simulated patch gap indicator"
+      ansible.windows.win_copy:
+        content: |
+          PATCH STATUS REPORT - WORKSTATION-WIN10-01
+          Generated: {{ ansible_date_time.date | default('2024-01-01') }}
+
+          MISSING PATCHES (SIMULATED):
+          - KB5034441  Windows Recovery Environment Update (Critical)  MISSING
+          - KB5033372  Cumulative Update Dec 2023                      MISSING
+          - KB5031356  .NET Framework Security Update                  MISSING
+
+          NOTE: This file simulates a host that has fallen behind on patching.
+          Real patch status can be checked via Get-HotFix and Windows Update API.
+        dest: C:\Windows\Temp\patch-gap-indicator.txt
+
+    - name: "MC-010 – Confirm BitLocker is not configured (lab default)"
+      ansible.windows.win_powershell:
+        script: |
+          $bl = Get-BitLockerVolume -MountPoint "C:" -ErrorAction SilentlyContinue
+          if ($bl -and $bl.ProtectionStatus -eq 'On') {
+            Write-Output "BitLocker is ON – finding MC-010 would NOT be detected."
+          } else {
+            Write-Output "BitLocker is OFF – MC-010 will be detected by audit scripts."
+          }
+      register: bl_status
+
+    - name: Show BitLocker status
+      debug:
+        var: bl_status.output
+
+
+# =============================================================================
+# WIN11 only: additional hardening (fewer findings – "well-configured" host)
+# =============================================================================
+- name: "[WIN11] Apply additional security hardening (fewer findings)"
+  hosts: workstation-win11
+  gather_facts: no
+
+  tasks:
+    - name: Enable Windows Defender Real-Time Protection
+      ansible.windows.win_powershell:
+        script: |
+          Set-MpPreference -DisableRealtimeMonitoring $false
+          Write-Output "Defender Real-Time Protection enabled."
+      ignore_errors: yes
+
+    - name: Enable Windows Firewall all profiles
+      ansible.windows.win_firewall:
+        state: enabled
+        profiles:
+          - Domain
+          - Private
+          - Public
+
+    - name: Set UAC to highest level
+      ansible.windows.win_regedit:
+        path: HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System
+        name: ConsentPromptBehaviorAdmin
+        data: 2
+        type: dword
+
+    - name: Configure event log sizes (audit target)
+      ansible.windows.win_powershell:
+        script: |
+          # Set larger event logs for more audit data
+          Limit-EventLog -LogName Application -MaximumSize 64MB
+          Limit-EventLog -LogName System      -MaximumSize 64MB
+          Limit-EventLog -LogName Security    -MaximumSize 256MB
+          Write-Output "Event log sizes configured."
+
+    - name: "WIN11 is intentionally well-configured – no MC-003 applied"
+      debug:
+        msg: "WIN11 does NOT have Domain Users in local Admins – use this as a clean baseline comparison."
+
+
+# =============================================================================
+# All workstations: final verification
+# =============================================================================
+- name: "[WORKSTATIONS] Post-deployment verification"
+  hosts: workstations
+  gather_facts: no
+
+  tasks:
+    - name: Verify domain membership
+      ansible.windows.win_powershell:
+        script: |
+          $cs = Get-WmiObject Win32_ComputerSystem
+          Write-Output "Computer: $($cs.Name)"
+          Write-Output "Domain:   $($cs.Domain)"
+          Write-Output "Workgroup:$($cs.Workgroup)"
+          if ($cs.PartOfDomain) {
+            Write-Output "STATUS: Domain-joined OK"
+          } else {
+            Write-Warning "STATUS: NOT domain-joined"
+          }
+      register: domain_check
+
+    - name: Show domain membership
+      debug:
+        var: domain_check.output
+
+    - name: Collect local Administrators group membership (for audit baseline)
+      ansible.windows.win_powershell:
+        script: |
+          Write-Output "=== Local Administrators on $env:COMPUTERNAME ==="
+          Get-LocalGroupMember -Group "Administrators" |
+            Select-Object Name, ObjectClass, PrincipalSource |
+            Format-Table -AutoSize | Out-String
+      register: local_admins
+
+    - name: Show local admins (review for MC-003)
+      debug:
+        var: local_admins.output
