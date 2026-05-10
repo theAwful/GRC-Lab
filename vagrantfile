@@ -1,62 +1,215 @@
-DOMAIN        = "corp.grclab.local"
-DC_PRIMARY_IP = "10.10.10.10"
-SWITCH_NAME   = "GRC-Lab-Switch"
+# -*- mode: ruby -*-
+# =============================================================================
+# GRC Hyper-V Lab – Vagrantfile
+# =============================================================================
+# IMPORTANT: This lab is managed from a Windows Hyper-V host.
+# Ansible does NOT run on Windows. Instead:
+#   1. All Windows VMs are bootstrapped via inline PowerShell (shell provisioner)
+#   2. AUDIT-BOX (Kali) installs Ansible on itself (ansible_local provisioner)
+#   3. AUDIT-BOX then runs Ansible over WinRM to configure all Windows VMs
+#   4. You trigger everything with: vagrant up (from Windows PowerShell as Admin)
+#
+# Prerequisites on the Windows host (run preflight-check.ps1 first):
+#   - Hyper-V enabled
+#   - Vagrant installed  (https://www.vagrantup.com)
+#   - Git installed      (https://git-scm.com)
+#   - GRC-Lab-Switch created (run .\scripts\setup\create-hyperv-switch.ps1)
+#   - No Ansible needed on Windows host
+# =============================================================================
+
+DOMAIN         = "corp.grclab.local"
+NETBIOS        = "GRCLAB"
+DC_PRIMARY_IP  = "10.10.10.10"
+DC_SECOND_IP   = "10.10.10.11"
+SWITCH_NAME    = "GRC-Lab-Switch"
+
+# All Windows VMs share this WinRM bootstrap script
+# Runs before Ansible takes over – opens WinRM, sets ExecutionPolicy
+WINRM_BOOTSTRAP = <<~'BOOTSTRAP'
+  Write-Host "[bootstrap] Configuring WinRM for Ansible..."
+  Set-ExecutionPolicy Unrestricted -Scope LocalMachine -Force
+
+  # Enable WinRM
+  winrm quickconfig -q
+  winrm set winrm/config '@{MaxTimeoutms="300000"}'
+  winrm set winrm/config/service '@{AllowUnencrypted="true"}'
+  winrm set winrm/config/service/auth '@{Basic="true"}'
+  winrm set winrm/config/service/auth '@{Negotiate="true"}'
+  winrm set winrm/config/winrs '@{MaxMemoryPerShellMB="1024"}'
+
+  # Open firewall for WinRM HTTP
+  $rule = Get-NetFirewallRule -Name "WinRM-HTTP-In-TCP" -ErrorAction SilentlyContinue
+  if (-not $rule) {
+    New-NetFirewallRule -Name "WinRM-HTTP-In-TCP" -DisplayName "WinRM HTTP" `
+      -Protocol TCP -LocalPort 5985 -Action Allow -Direction Inbound | Out-Null
+  }
+
+  # Allow ICMP (ping)
+  Enable-NetFirewallRule -DisplayName "File and Printer Sharing (Echo Request - ICMPv4-In)" `
+    -ErrorAction SilentlyContinue
+
+  # Enable Remote Desktop
+  Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+    -Name 'fDenyTSConnections' -Value 0
+  Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
+
+  Write-Host "[bootstrap] WinRM configured. Ready for Ansible."
+BOOTSTRAP
 
 MACHINES = [
-  { name: "DC-PRIMARY",          box: "gusztavvargadr/windows-server-2022-standard", ip: "10.10.10.10", ram: 4096, cpus: 2 },
-  { name: "DC-SECONDARY",        box: "gusztavvargadr/windows-server-2022-standard", ip: "10.10.10.11", ram: 4096, cpus: 2 },
-  { name: "MEMBER-SERVER-01",    box: "gusztavvargadr/windows-server-2019-standard", ip: "10.10.10.20", ram: 4096, cpus: 2 },
-  { name: "MEMBER-SERVER-02",    box: "gusztavvargadr/windows-server-2019-standard", ip: "10.10.10.21", ram: 4096, cpus: 2 },
-  { name: "WORKSTATION-WIN10-01",box: "gusztavvargadr/windows-10-enterprise",        ip: "10.10.10.31", ram: 4096, cpus: 2 },
-  { name: "WORKSTATION-WIN10-02",box: "gusztavvargadr/windows-10-enterprise",        ip: "10.10.10.32", ram: 4096, cpus: 2 },
-  { name: "WORKSTATION-WIN11",   box: "gusztavvargadr/windows-11-enterprise",        ip: "10.10.10.33", ram: 4096, cpus: 2 },
-  { name: "AUDIT-BOX",           box: "kalilinux/rolling",                           ip: "10.10.10.50", ram: 4096, cpus: 2 },
+  {
+    name:  "DC-PRIMARY",
+    box:   "gusztavvargadr/windows-server-2022-standard",
+    ip:    "10.10.10.10",
+    ram:   4096,
+    cpus:  2,
+    group: "domain_controllers"
+  },
+  {
+    name:  "DC-SECONDARY",
+    box:   "gusztavvargadr/windows-server-2022-standard",
+    ip:    "10.10.10.11",
+    ram:   4096,
+    cpus:  2,
+    group: "domain_controllers"
+  },
+  {
+    name:  "MEMBER-SERVER-01",
+    box:   "gusztavvargadr/windows-server-2019-standard",
+    ip:    "10.10.10.20",
+    ram:   4096,
+    cpus:  2,
+    group: "member_servers"
+  },
+  {
+    name:  "MEMBER-SERVER-02",
+    box:   "gusztavvargadr/windows-server-2019-standard",
+    ip:    "10.10.10.21",
+    ram:   4096,
+    cpus:  2,
+    group: "member_servers"
+  },
+  {
+    name:  "WORKSTATION-WIN10-01",
+    box:   "gusztavvargadr/windows-10-enterprise",
+    ip:    "10.10.10.31",
+    ram:   4096,
+    cpus:  2,
+    group: "workstations"
+  },
+  {
+    name:  "WORKSTATION-WIN10-02",
+    box:   "gusztavvargadr/windows-10-enterprise",
+    ip:    "10.10.10.32",
+    ram:   4096,
+    cpus:  2,
+    group: "workstations"
+  },
+  {
+    name:  "WORKSTATION-WIN11",
+    box:   "gusztavvargadr/windows-11-enterprise",
+    ip:    "10.10.10.33",
+    ram:   4096,
+    cpus:  2,
+    group: "workstations"
+  },
+  {
+    name:  "AUDIT-BOX",
+    box:   "kalilinux/rolling",
+    ip:    "10.10.10.50",
+    ram:   4096,
+    cpus:  2,
+    group: "audit"
+  }
 ].freeze
 
 Vagrant.configure("2") do |config|
+
+  # ── Global Hyper-V provider defaults ───────────────────────────────────────
   config.vm.provider "hyperv" do |h|
     h.enable_virtualization_extensions = true
-    h.linked_clone = true
-    h.vm_integration_services = { guest_service_interface: true }
+    h.linked_clone                     = true
+    h.vm_integration_services          = { guest_service_interface: true }
   end
 
-  MACHINES.each do |vm_cfg|
-    config.vm.define vm_cfg[:name] do |machine|
-      machine.vm.box      = vm_cfg[:box]
-      machine.vm.hostname = vm_cfg[:name].downcase
-      machine.vm.network  "private_network", ip: vm_cfg[:ip], bridge: SWITCH_NAME
+  # ── Define each VM ──────────────────────────────────────────────────────────
+  MACHINES.each do |vm|
 
-      machine.vm.provider "hyperv" do |h|
-        h.vmname    = vm_cfg[:name]
-        h.memory    = vm_cfg[:ram]
-        h.maxmemory = vm_cfg[:ram]
-        h.cpus      = vm_cfg[:cpus]
+    config.vm.define vm[:name] do |m|
+
+      m.vm.box      = vm[:box]
+      m.vm.hostname = vm[:name].downcase.gsub("-", "-")
+
+      m.vm.network "private_network",
+        ip:     vm[:ip],
+        bridge: SWITCH_NAME
+
+      m.vm.provider "hyperv" do |h|
+        h.vmname    = vm[:name]
+        h.memory    = vm[:ram]
+        h.maxmemory = vm[:ram]
+        h.cpus      = vm[:cpus]
       end
 
-      unless vm_cfg[:name] == "AUDIT-BOX"
-        machine.vm.communicator       = "winrm"
-        machine.winrm.username        = "vagrant"
-        machine.winrm.password        = "vagrant"
-        machine.winrm.transport       = :negotiate
-        machine.winrm.basic_auth_only = false
-        machine.winrm.timeout         = 300
-        machine.winrm.retry_limit     = 20
-      end
+      # ── Windows VMs: WinRM communicator + PowerShell bootstrap ─────────────
+      if vm[:name] != "AUDIT-BOX"
 
-      # Ansible runs from AUDIT-BOX against all others
-      if vm_cfg[:name] == "AUDIT-BOX"
-        machine.vm.provision "ansible" do |ansible|
-          ansible.playbook       = "ansible/playbooks/site.yml"
-          ansible.inventory_path = "ansible/inventory.yml"
-          ansible.limit          = "all"
-          ansible.verbose        = "v"
-          ansible.extra_vars     = {
-            domain_name:             DOMAIN,
-            dc_primary_ip:           DC_PRIMARY_IP,
-            ansible_winrm_transport: "ntlm"
-          }
+        m.vm.communicator        = "winrm"
+        m.winrm.username         = "vagrant"
+        m.winrm.password         = "vagrant"
+        m.winrm.transport        = :negotiate
+        m.winrm.basic_auth_only  = false
+        m.winrm.timeout          = 300
+        m.winrm.retry_limit      = 20
+
+        # Step 1: PowerShell bootstrap (runs from Windows host via WinRM)
+        # Opens WinRM fully so Ansible can connect from AUDIT-BOX later
+        m.vm.provision "shell",
+          name:   "WinRM Bootstrap",
+          inline: WINRM_BOOTSTRAP,
+          powershell_elevated_interactive: false
+
+        # Step 2: Copy the AD population script to DC-PRIMARY
+        if vm[:name] == "DC-PRIMARY"
+          m.vm.provision "file",
+            source:      "scripts/setup/Invoke-ADLabPopulate.ps1",
+            destination: "C:\\Windows\\Temp\\Invoke-ADLabPopulate.ps1"
         end
+
       end
+
+      # ── AUDIT-BOX (Kali): SSH communicator + ansible_local provisioner ─────
+      if vm[:name] == "AUDIT-BOX"
+
+        m.vm.communicator = "ssh"
+
+        # Step 1: Install Ansible and required collections on AUDIT-BOX itself
+        m.vm.provision "shell",
+          name: "Install Ansible on AUDIT-BOX",
+          path: "scripts/setup/bootstrap-audit-box.sh"
+
+        # Step 2: Run ansible_local – Ansible executes ON AUDIT-BOX, targets
+        # all other VMs over WinRM. No Ansible needed on Windows host.
+        m.vm.provision "ansible_local",
+          playbook:       "ansible/playbooks/site.yml",
+          inventory_path: "ansible/inventory.yml",
+          install:        false,          # already installed by shell above
+          limit:          "all",
+          verbose:        "v",
+          galaxy_role_file: "ansible/requirements.yml",
+          galaxy_roles_path: "/home/vagrant/.ansible/roles",
+          extra_vars: {
+            domain_name:              DOMAIN,
+            domain_netbios:           NETBIOS,
+            dc_primary_ip:            DC_PRIMARY_IP,
+            dc_secondary_ip:          DC_SECOND_IP,
+            seed_misconfigurations:   true,
+            ansible_winrm_transport:  "ntlm"
+          }
+
+      end
+
     end
   end
+
 end
