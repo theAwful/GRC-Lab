@@ -67,33 +67,40 @@ Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V
 
 ## Step 2 – Install Dependencies
 
+You only need two tools on your Windows host. **Do not install Ansible, Python, or
+ansible-galaxy here** — all of that runs automatically inside AUDIT-BOX.
+
 ```powershell
-# Install Chocolatey
+# Option A: Download and install manually (recommended)
+#   Vagrant: https://developer.hashicorp.com/vagrant/downloads
+#   Git:     https://git-scm.com/download/win
+
+# Option B: Chocolatey
 Set-ExecutionPolicy Bypass -Scope Process -Force
 [System.Net.ServicePointManager]::SecurityProtocol = `
     [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
 Invoke-Expression ((New-Object System.Net.WebClient).DownloadString(
     'https://community.chocolatey.org/install.ps1'))
 
-# Install core tools
-choco install vagrant git python3 -y
+choco install vagrant git -y
+```
 
-# Verify versions
-vagrant --version    # 2.4+
-python --version     # 3.10+
-git --version
+Install the Vagrant reload plugin (needed for Windows VM reboots during provisioning):
 
-# Python packages for Ansible WinRM
-pip install ansible pywinrm requests-ntlm requests-kerberos
-
-# Ansible collections (required)
-ansible-galaxy collection install ansible.windows
-ansible-galaxy collection install community.windows
-ansible-galaxy collection install microsoft.ad
-
-# Vagrant plugin
+```powershell
 vagrant plugin install vagrant-reload
 ```
+
+Verify:
+
+```powershell
+vagrant --version   # 2.4.0 or newer
+git --version
+```
+
+> **That's it for the Windows host.** Ansible, Python, pywinrm, and all Galaxy
+> collections are installed automatically inside AUDIT-BOX by
+> `scripts/setup/bootstrap-audit-box.sh` when you run `vagrant up`.
 
 ---
 
@@ -116,7 +123,7 @@ This validates:
 - Hyper-V is enabled
 - The `GRC-Lab-Switch` virtual switch exists (or reminds you to create it)
 - Sufficient RAM and disk space
-- Vagrant, Ansible, and pywinrm are installed
+- Vagrant and Git are installed
 
 Fix any `[FAIL]` items before continuing.
 
@@ -294,12 +301,21 @@ vagrant box add gusztavvargadr/windows-server-2022-standard --provider hyperv
 
 ### Ansible "unreachable" for Windows hosts
 
-```powershell
-# Verify pywinrm is installed correctly
-python -c "import winrm; print(winrm.__version__)"
+Ansible runs inside AUDIT-BOX, not on your Windows host. SSH into AUDIT-BOX and debug from there:
 
-# Check group_vars/all.yml has correct transport
-# ansible_winrm_transport: ntlm
+```bash
+# SSH into AUDIT-BOX
+vagrant ssh AUDIT-BOX
+
+# Verify pywinrm is installed inside AUDIT-BOX
+python3 -c "import winrm; print(winrm.__version__)"
+
+# Test WinRM connectivity from AUDIT-BOX to a Windows VM
+nc -zv 10.10.10.10 5985 && echo "WinRM reachable"
+
+# Re-run Ansible manually from inside AUDIT-BOX
+cd /vagrant
+ansible-playbook -i ansible/inventory.yml ansible/playbooks/site.yml -v
 ```
 
 ### Domain join fails on member servers / workstations
@@ -336,11 +352,17 @@ $env:VAGRANT_HOME = "D:\.vagrant.d"
 
 ```powershell
 # Option A: Restore to baseline snapshot (fastest – ~2 min)
+# Run on Windows host as Administrator
 .\scripts\setup\restore-snapshots.ps1 -Action Restore -SnapshotName "baseline" -Force
+```
 
-# Option B: Re-run only Ansible provisioning (no VM rebuild – ~20 min)
-ansible-playbook -i ansible/inventory.yml ansible/playbooks/site.yml
+```powershell
+# Option B: Re-run only Ansible provisioning (no VM rebuild – ~20-30 min)
+# Vagrant re-triggers ansible_local on AUDIT-BOX – no Ansible needed on Windows
+vagrant provision AUDIT-BOX
+```
 
+```powershell
 # Option C: Full destroy and rebuild (slowest – 60-90 min)
 vagrant destroy -f
 vagrant up
