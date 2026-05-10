@@ -1,0 +1,28 @@
+---
+# =============================================================================
+# GRC Hyper-V Lab – Ansible Galaxy Requirements
+# ansible/requirements.yml
+#
+# Used by the ansible_local provisioner in Vagrantfile:
+#   galaxy_role_file: "ansible/requirements.yml"
+#
+# To install manually on AUDIT-BOX:
+#   ansible-galaxy collection install -r ansible/requirements.yml
+# =============================================================================
+
+collections:
+  # Windows management – win_* modules
+  - name: ansible.windows
+    version: ">=2.4.0"
+
+  # Additional Windows modules (win_iis_website, win_timezone, win_share, etc.)
+  - name: community.windows
+    version: ">=2.3.0"
+
+  # Active Directory modules (microsoft.ad.domain, microsoft.ad.user, etc.)
+  - name: microsoft.ad
+    version: ">=1.7.0"
+
+  # General utilities
+  - name: community.general
+    version: ">=9.0.0"
