@@ -1,0 +1,348 @@
+---
+# =============================================================================
+# GRC Hyper-V Lab – Member Servers Playbook
+# MEMBER-SERVER-01: Windows Server 2019 – File Server / DFS (10.10.10.20)
+# MEMBER-SERVER-02: Windows Server 2019 – IIS Web Server   (10.10.10.21)
+# =============================================================================
+
+- name: "[MEMBER-SERVERS] Apply common baseline and domain-join"
+  hosts: member_servers
+  gather_facts: no
+  vars:
+    ansible_winrm_operation_timeout_sec: 120
+    ansible_winrm_read_timeout_sec: 150
+
+  pre_tasks:
+    - name: Wait for WinRM
+      ansible.windows.win_wait_for:
+        host: "{{ ansible_host }}"
+        port: 5985
+        timeout: 300
+        delay: 10
+
+    - name: Confirm connectivity
+      ansible.windows.win_ping:
+
+    - name: Set DNS to domain controllers
+      ansible.windows.win_powershell:
+        script: |
+          $adapters = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' }
+          foreach ($a in $adapters) {
+            Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex `
+              -ServerAddresses @("{{ dc_primary_ip }}", "{{ dc_secondary_ip }}")
+          }
+          Clear-DnsClientCache
+          Write-Output "DNS configured."
+
+  roles:
+    - common
+    - member-server
+
+
+# =============================================================================
+# MEMBER-SERVER-01: File Server role
+# =============================================================================
+- name: "[MEMBER-SERVER-01] Configure File Server and DFS"
+  hosts: member-server-01
+  gather_facts: no
+
+  tasks:
+    - name: Install File Server role and DFS features
+      ansible.windows.win_feature:
+        name:
+          - FS-FileServer
+          - FS-DFS-Namespace
+          - FS-DFS-Replication
+          - FS-Resource-Manager
+          - RSAT-DFS-Mgmt-Con
+        include_management_tools: yes
+        state: present
+      register: fs_features
+
+    - name: Reboot if required after feature install
+      ansible.windows.win_reboot:
+        reboot_timeout: 300
+      when: fs_features.reboot_required
+
+    - name: Create root share directories
+      ansible.windows.win_file:
+        path: "{{ item }}"
+        state: directory
+      loop:
+        - C:\Shares\Finance
+        - C:\Shares\HR
+        - C:\Shares\Legal
+        - C:\Shares\Engineering
+        - C:\Shares\General
+        - C:\Shares\IT-Admin
+        - C:\Shares\Executive
+
+    - name: Create Finance share
+      ansible.windows.win_share:
+        name: Finance
+        path: C:\Shares\Finance
+        description: "Finance Department Share – SOX Controlled"
+        full: "GRCLAB\\FS-Finance-ReadWrite"
+        read: "GRCLAB\\FS-Finance-ReadOnly"
+        deny: "GRCLAB\\GRP-Contractors"
+        list: yes
+        state: present
+
+    - name: Create HR share
+      ansible.windows.win_share:
+        name: HR
+        path: C:\Shares\HR
+        description: "HR Confidential – PII Data"
+        full: "GRCLAB\\FS-HR-Confidential"
+        deny: "GRCLAB\\GRP-Contractors"
+        list: no
+        state: present
+
+    - name: Create Legal share
+      ansible.windows.win_share:
+        name: Legal
+        path: C:\Shares\Legal
+        description: "Legal & Compliance – Confidential"
+        full: "GRCLAB\\FS-Legal-Confidential"
+        list: no
+        state: present
+
+    - name: Create Engineering share
+      ansible.windows.win_share:
+        name: Engineering
+        path: C:\Shares\Engineering
+        description: "Engineering Source and Build Artifacts"
+        full: "GRCLAB\\FS-Engineering-Repos"
+        list: yes
+        state: present
+
+    - name: Create General share
+      ansible.windows.win_share:
+        name: General
+        path: C:\Shares\General
+        description: "General Company Shared Drive"
+        full: "GRCLAB\\FS-Shared-General"
+        list: yes
+        state: present
+
+    - name: Create IT-Admin share
+      ansible.windows.win_share:
+        name: IT-Admin
+        path: C:\Shares\IT-Admin
+        description: "IT Admin Scripts and Tools – Restricted"
+        full: "GRCLAB\\FS-IT-Admin-Share"
+        list: no
+        state: present
+
+    - name: Set NTFS permissions on Finance share (explicit)
+      ansible.windows.win_powershell:
+        script: |
+          $acl = Get-Acl "C:\Shares\Finance"
+          # Add Finance ReadWrite
+          $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            "GRCLAB\FS-Finance-ReadWrite", "Modify", "ContainerInherit,ObjectInherit", "None", "Allow")
+          $acl.AddAccessRule($rule)
+          # Add ReadOnly
+          $rule2 = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            "GRCLAB\FS-Finance-ReadOnly", "ReadAndExecute", "ContainerInherit,ObjectInherit", "None", "Allow")
+          $acl.AddAccessRule($rule2)
+          # Deny contractors
+          $rule3 = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            "GRCLAB\GRP-Contractors", "FullControl", "ContainerInherit,ObjectInherit", "None", "Deny")
+          $acl.AddAccessRule($rule3)
+          Set-Acl "C:\Shares\Finance" $acl
+          Write-Output "Finance NTFS ACL configured."
+
+    - name: Create some dummy files to make shares realistic
+      ansible.windows.win_powershell:
+        script: |
+          $files = @{
+            "C:\Shares\Finance\Q1-2024-Budget.xlsx"           = "Budget data Q1 2024"
+            "C:\Shares\Finance\Payroll-Summary-March.xlsx"    = "Payroll summary"
+            "C:\Shares\Finance\Annual-Report-2023.pdf"        = "Annual report placeholder"
+            "C:\Shares\Finance\SOX-Controls-Matrix.xlsx"      = "SOX controls matrix"
+            "C:\Shares\HR\Employee-Handbook-v4.pdf"           = "Employee handbook"
+            "C:\Shares\HR\Org-Chart-2024.xlsx"               = "Org chart"
+            "C:\Shares\Legal\NDA-Template-v2.docx"           = "NDA template"
+            "C:\Shares\Legal\Privacy-Policy-2024.pdf"        = "Privacy policy"
+            "C:\Shares\General\IT-Policies-Acceptable-Use.pdf"= "AUP document"
+            "C:\Shares\General\VPN-Setup-Instructions.pdf"   = "VPN setup guide"
+            "C:\Shares\Engineering\deployment-runbook.md"    = "Deployment runbook"
+            "C:\Shares\IT-Admin\ad-audit-scripts\README.txt" = "Audit scripts directory"
+          }
+          foreach ($path in $files.Keys) {
+            $dir = Split-Path $path -Parent
+            if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+            Set-Content -Path $path -Value $files[$path]
+          }
+          Write-Output "Placeholder files created."
+
+    # MC-004: SMBv1 enabled (intentional misconfiguration)
+    - name: "MC-004 – Enable SMBv1 (intentional GRC finding)"
+      ansible.windows.win_powershell:
+        script: |
+          Set-SmbServerConfiguration -EnableSMB1Protocol $true -Force
+          Set-SmbServerConfiguration -RequireSecuritySignature $false -Force
+          Set-SmbClientConfiguration -RequireSecuritySignature $false -Force
+          Write-Output "SMBv1 enabled, signing not required (MC-004)"
+      when: mc_004_smbv1_enabled | default(true)
+
+    - name: Verify file shares are accessible
+      ansible.windows.win_powershell:
+        script: |
+          Get-SmbShare | Select-Object Name, Path, Description | Format-Table -AutoSize
+      register: share_list
+
+    - name: Show shares
+      debug:
+        var: share_list.output
+
+
+# =============================================================================
+# MEMBER-SERVER-02: IIS Web Server role
+# =============================================================================
+- name: "[MEMBER-SERVER-02] Configure IIS Web Server"
+  hosts: member-server-02
+  gather_facts: no
+
+  tasks:
+    - name: Install IIS and management features
+      ansible.windows.win_feature:
+        name:
+          - Web-Server
+          - Web-Common-Http
+          - Web-Default-Doc
+          - Web-Dir-Browsing
+          - Web-Http-Errors
+          - Web-Static-Content
+          - Web-Http-Redirect
+          - Web-Http-Logging
+          - Web-Request-Monitor
+          - Web-Security
+          - Web-Windows-Auth
+          - Web-Mgmt-Tools
+          - Web-Mgmt-Console
+          - Web-Mgmt-Service
+          - NET-Framework-45-Core
+          - NET-Framework-45-ASPNET
+          - Web-Asp-Net45
+        include_management_tools: yes
+        state: present
+      register: iis_features
+
+    - name: Reboot if required after IIS install
+      ansible.windows.win_reboot:
+        reboot_timeout: 300
+      when: iis_features.reboot_required
+
+    - name: Create web content directories
+      ansible.windows.win_file:
+        path: "{{ item }}"
+        state: directory
+      loop:
+        - C:\inetpub\intranet
+        - C:\inetpub\dev-staging
+        - C:\inetpub\itportal
+
+    - name: Deploy intranet default page
+      ansible.windows.win_copy:
+        content: |
+          <!DOCTYPE html>
+          <html>
+          <head><title>GRCLAB Intranet</title></head>
+          <body>
+            <h1>GRCLAB Corp – Internal Portal</h1>
+            <p>Server: MEMBER-SERVER-02 | Environment: GRC Lab</p>
+            <p>This is a simulated intranet for GRC audit testing.</p>
+            <ul>
+              <li><a href="/itportal">IT Portal</a></li>
+              <li><a href="/dev-staging">Dev Staging</a></li>
+            </ul>
+          </body>
+          </html>
+        dest: C:\inetpub\intranet\index.html
+
+    - name: Deploy IT portal page
+      ansible.windows.win_copy:
+        content: |
+          <!DOCTYPE html>
+          <html>
+          <head><title>GRCLAB IT Portal</title></head>
+          <body>
+            <h1>IT Self-Service Portal</h1>
+            <p>Submit tickets | Password reset | Software requests</p>
+            <p>Domain: corp.grclab.local</p>
+          </body>
+          </html>
+        dest: C:\inetpub\itportal\index.html
+
+    - name: Create IIS site – Intranet
+      community.windows.win_iis_website:
+        name: "GRC-Intranet"
+        state: started
+        port: 80
+        ip: "*"
+        hostname: intranet.corp.grclab.local
+        physical_path: C:\inetpub\intranet
+        application_pool: DefaultAppPool
+
+    - name: Create IIS site – IT Portal
+      community.windows.win_iis_website:
+        name: "GRC-IT-Portal"
+        state: started
+        port: 8080
+        ip: "*"
+        physical_path: C:\inetpub\itportal
+        application_pool: DefaultAppPool
+
+    - name: Enable IIS Windows Authentication on intranet site
+      ansible.windows.win_powershell:
+        script: |
+          Import-Module WebAdministration
+          Set-WebConfigurationProperty `
+            -Filter "system.webServer/security/authentication/windowsAuthentication" `
+            -PSPath "IIS:\Sites\GRC-Intranet" `
+            -Name "enabled" -Value $true
+          Set-WebConfigurationProperty `
+            -Filter "system.webServer/security/authentication/anonymousAuthentication" `
+            -PSPath "IIS:\Sites\GRC-Intranet" `
+            -Name "enabled" -Value $false
+          Write-Output "Windows Authentication enabled on GRC-Intranet."
+
+    - name: Configure IIS request logging
+      ansible.windows.win_powershell:
+        script: |
+          Import-Module WebAdministration
+          Set-WebConfigurationProperty `
+            -Filter "system.applicationHost/log" `
+            -PSPath "IIS:\" `
+            -Name "centralLogFileMode" -Value "Site"
+          Write-Output "IIS logging configured."
+
+    # MC-008: WinRM HTTP only – no HTTPS listener (intentional finding)
+    - name: "MC-008 – Ensure only HTTP WinRM listener exists (no HTTPS)"
+      ansible.windows.win_powershell:
+        script: |
+          # Remove HTTPS listener if present
+          $httpsListener = Get-ChildItem WSMan:\localhost\Listener |
+            Where-Object { $_.Keys -match "Transport=HTTPS" }
+          if ($httpsListener) {
+            Remove-Item -Path $httpsListener.PSPath -Recurse -Force
+            Write-Output "HTTPS WinRM listener removed (MC-008)"
+          } else {
+            Write-Output "No HTTPS listener present – MC-008 condition met."
+          }
+      when: mc_008_winrm_http_only | default(true)
+
+    - name: Verify IIS sites
+      ansible.windows.win_powershell:
+        script: |
+          Import-Module WebAdministration
+          Get-Website | Select-Object Name, State, physicalPath,
+            @{N='Bindings';E={$_.bindings.collection | ForEach-Object {"$($_.protocol):$($_.bindingInformation)"}}} |
+            Format-List
+      register: iis_sites
+
+    - name: Show IIS sites
+      debug:
+        var: iis_sites.output
