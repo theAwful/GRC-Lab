@@ -1,0 +1,160 @@
+---
+# =============================================================================
+# GRC Hyper-V Lab – Domain Controllers Playbook
+# Deploys DC-PRIMARY (new forest) then DC-SECONDARY (replica)
+# =============================================================================
+
+# ─── Pass 1: Primary DC – install AD DS and promote ──────────────────────────
+- name: "[DC-PRIMARY] Install and configure Primary Domain Controller"
+  hosts: dc-primary
+  gather_facts: no
+  vars:
+    ansible_winrm_operation_timeout_sec: 120
+    ansible_winrm_read_timeout_sec: 150
+
+  pre_tasks:
+    - name: Wait for WinRM to be available
+      ansible.windows.win_wait_for:
+        host: "{{ ansible_host }}"
+        port: 5985
+        timeout: 300
+        delay: 10
+
+    - name: Confirm connectivity
+      ansible.windows.win_ping:
+
+  roles:
+    - common
+    - dc-primary
+
+  post_tasks:
+    - name: Wait for DC-PRIMARY to fully come back after reboot
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host }}"
+        port: 5985
+        delay: 60
+        timeout: 300
+      delegate_to: localhost
+
+    - name: Verify AD DS is responding
+      ansible.windows.win_powershell:
+        script: |
+          Import-Module ActiveDirectory -ErrorAction Stop
+          $domain = Get-ADDomain -ErrorAction Stop
+          Write-Output "Domain: $($domain.DNSRoot)"
+          Write-Output "PDCEmulator: $($domain.PDCEmulator)"
+      register: dc_verify
+      retries: 5
+      delay: 30
+      until: dc_verify.rc == 0
+
+    - name: Show domain info
+      debug:
+        var: dc_verify.output
+
+
+# ─── Pass 2: Secondary DC – join domain and promote ──────────────────────────
+- name: "[DC-SECONDARY] Install and configure Secondary Domain Controller"
+  hosts: dc-secondary
+  gather_facts: no
+  vars:
+    ansible_winrm_operation_timeout_sec: 120
+    ansible_winrm_read_timeout_sec: 150
+
+  pre_tasks:
+    - name: Wait for WinRM to be available
+      ansible.windows.win_wait_for:
+        host: "{{ ansible_host }}"
+        port: 5985
+        timeout: 300
+        delay: 10
+
+    - name: Confirm connectivity
+      ansible.windows.win_ping:
+
+    - name: Set DNS to point at DC-PRIMARY before promotion
+      ansible.windows.win_powershell:
+        script: |
+          $adapters = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' }
+          foreach ($a in $adapters) {
+            Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex `
+              -ServerAddresses @("{{ dc_primary_ip }}", "8.8.8.8")
+          }
+          # Flush DNS to pick up new servers
+          Clear-DnsClientCache
+          Write-Output "DNS set to {{ dc_primary_ip }}"
+
+  roles:
+    - common
+    - dc-secondary
+
+  post_tasks:
+    - name: Wait for DC-SECONDARY after reboot
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host }}"
+        port: 5985
+        delay: 60
+        timeout: 300
+      delegate_to: localhost
+
+    - name: Verify replication health
+      ansible.windows.win_powershell:
+        script: |
+          $result = repadmin /replsummary 2>&1
+          Write-Output $result
+          # Check for failures
+          if ($result -match 'fail') {
+            Write-Warning "Replication failures detected – review repadmin output above"
+          } else {
+            Write-Output "Replication appears healthy."
+          }
+      register: repl_check
+
+    - name: Show replication summary
+      debug:
+        var: repl_check.output
+
+
+# ─── Pass 3: Populate AD with users, groups, computers, GPOs ─────────────────
+- name: "[DC-PRIMARY] Populate Active Directory"
+  hosts: dc-primary
+  gather_facts: no
+
+  tasks:
+    - name: Run AD population script
+      ansible.windows.win_powershell:
+        script: |
+          $flagFile = "C:\Windows\Temp\ad-populated.flag"
+          if (Test-Path $flagFile) {
+            Write-Output "AD already populated – skipping. Delete $flagFile to re-run."
+            exit 0
+          }
+
+          $scriptPath = "C:\Windows\Temp\Invoke-ADLabPopulate.ps1"
+          if (-not (Test-Path $scriptPath)) {
+            Write-Error "Population script not found at $scriptPath. Copy it first."
+            exit 1
+          }
+
+          & $scriptPath `
+            -DomainName "{{ domain_name }}" `
+            -DomainNetBIOS "{{ domain_netbios }}" `
+            -DefaultPassword "{{ domain_admin_pass }}" `
+            {{ '-SeedMisconfigurations' if seed_misconfigurations | default(true) else '' }}
+
+          if ($LASTEXITCODE -eq 0 -or $?) {
+            Set-Content -Path $flagFile -Value "Populated: $(Get-Date -Format 'yyyy-MM-dd HH:mm')"
+            Write-Output "AD population complete."
+          }
+        error_action: continue
+      register: pop_result
+      timeout: 900
+
+    - name: Show population output
+      debug:
+        var: pop_result.output
+
+    - name: Show any population errors
+      debug:
+        var: pop_result.error
+      when: pop_result.error | length > 0
