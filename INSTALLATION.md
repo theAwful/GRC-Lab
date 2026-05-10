@@ -1,5 +1,32 @@
 # Installation Guide
 
+> **Windows host users:** Ansible does not run on Windows. This lab solves that by running Ansible *inside* the AUDIT-BOX (Kali) VM — Vagrant boots it and triggers Ansible automatically. You only need Vagrant and Git on your Windows machine.
+
+---
+
+## How the Deployment Works
+
+```
+Your Windows Host (Hyper-V)
+  │
+  ├─ vagrant up
+  │
+  │  1. Boots all Windows VMs
+  │     └─ PowerShell WinRM bootstrap runs on each
+  │
+  │  2. Boots AUDIT-BOX (Kali)
+  │     └─ bootstrap-audit-box.sh installs Ansible + Galaxy collections
+  │
+  │  3. ansible_local provisioner fires ON AUDIT-BOX
+  │     └─ Ansible targets all Windows VMs over WinRM
+  │        Promotes DCs, populates AD, configures everything
+  └──────────────────────────────────────────────────────────
+```
+
+**You need on Windows: Vagrant + Git only. No Ansible. No Python. No WSL.**
+
+---
+
 Complete step-by-step instructions for deploying the GRC Hyper-V Lab from scratch.
 
 ---
