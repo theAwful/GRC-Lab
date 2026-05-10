@@ -1,0 +1,269 @@
+---
+# =============================================================================
+# GRC Hyper-V Lab – Common Role
+# Applied to ALL Windows hosts before any role-specific tasks.
+# Sets up WinRM, firewall, timezone, DNS suffix, PowerShell policy.
+# =============================================================================
+
+# ─── WinRM ────────────────────────────────────────────────────────────────────
+- name: Ensure WinRM service is running and set to auto-start
+  ansible.windows.win_service:
+    name: WinRM
+    state: started
+    start_mode: auto
+
+- name: Configure WinRM for lab use
+  ansible.windows.win_powershell:
+    script: |
+      # Enable WinRM with default settings
+      winrm quickconfig -q 2>&1 | Out-Null
+
+      # Allow unencrypted (for HTTP in lab – MC-008 intentional on member servers)
+      winrm set winrm/config/service '@{AllowUnencrypted="true"}' 2>&1 | Out-Null
+      winrm set winrm/config/service/auth '@{Basic="true"}' 2>&1 | Out-Null
+      winrm set winrm/config/service/auth '@{Negotiate="true"}' 2>&1 | Out-Null
+
+      # Increase timeouts for slow lab VMs
+      winrm set winrm/config '@{MaxTimeoutms="300000"}' 2>&1 | Out-Null
+      winrm set winrm/config/winrs '@{MaxMemoryPerShellMB="1024"}' 2>&1 | Out-Null
+      winrm set winrm/config/winrs '@{MaxShellsPerUser="30"}' 2>&1 | Out-Null
+
+      Write-Output "WinRM configured."
+
+- name: Allow WinRM HTTP (5985) through Windows Firewall
+  ansible.windows.win_firewall_rule:
+    name: "WinRM-HTTP-Lab"
+    localport: "5985"
+    protocol: tcp
+    direction: in
+    action: allow
+    state: present
+    enabled: yes
+    description: "GRC Lab – WinRM HTTP access"
+
+- name: Allow WinRM HTTPS (5986) through Windows Firewall
+  ansible.windows.win_firewall_rule:
+    name: "WinRM-HTTPS-Lab"
+    localport: "5986"
+    protocol: tcp
+    direction: in
+    action: allow
+    state: present
+    enabled: yes
+    description: "GRC Lab – WinRM HTTPS access"
+
+- name: Allow ICMP (ping) through Windows Firewall
+  ansible.windows.win_firewall_rule:
+    name: "Allow-ICMP-Lab"
+    protocol: icmpv4
+    direction: in
+    action: allow
+    state: present
+    enabled: yes
+    description: "GRC Lab – allow ping for connectivity testing"
+
+- name: Allow RDP (3389) through Windows Firewall
+  ansible.windows.win_firewall_rule:
+    name: "RDP-Lab"
+    localport: "3389"
+    protocol: tcp
+    direction: in
+    action: allow
+    state: present
+    enabled: yes
+    description: "GRC Lab – RDP access"
+
+
+# ─── PowerShell ────────────────────────────────────────────────────────────────
+- name: Set PowerShell execution policy to RemoteSigned
+  ansible.windows.win_powershell:
+    script: |
+      Set-ExecutionPolicy RemoteSigned -Scope LocalMachine -Force
+      Write-Output "Execution policy: $(Get-ExecutionPolicy -Scope LocalMachine)"
+
+- name: Enable PowerShell remoting
+  ansible.windows.win_powershell:
+    script: |
+      Enable-PSRemoting -Force -SkipNetworkProfileCheck
+      Write-Output "PS Remoting enabled."
+
+
+# ─── Time / Locale ─────────────────────────────────────────────────────────────
+- name: Set timezone to Eastern Standard Time
+  community.windows.win_timezone:
+    timezone: Eastern Standard Time
+
+- name: Sync time with domain controller (or internet NTP)
+  ansible.windows.win_powershell:
+    script: |
+      w32tm /resync /force 2>&1 | Out-Null
+      Write-Output "Time synced: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+  ignore_errors: yes
+
+
+# ─── Network ───────────────────────────────────────────────────────────────────
+- name: Set DNS suffix search list
+  ansible.windows.win_powershell:
+    script: |
+      Set-DnsClientGlobalSetting `
+        -SuffixSearchList @("corp.grclab.local", "grclab.local") `
+        -ErrorAction SilentlyContinue
+      Write-Output "DNS suffix list set."
+
+- name: Disable IPv6 on all adapters (lab simplification)
+  ansible.windows.win_powershell:
+    script: |
+      Get-NetAdapter | ForEach-Object {
+        Disable-NetAdapterBinding -Name $_.Name -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue
+      }
+      Write-Output "IPv6 disabled on all adapters."
+  ignore_errors: yes
+
+- name: Disable network auto-discovery prompts
+  ansible.windows.win_regedit:
+    path: HKLM:\SYSTEM\CurrentControlSet\Control\Network\NewNetworkWindowOff
+    state: present
+
+
+# ─── Remote Desktop ────────────────────────────────────────────────────────────
+- name: Enable Remote Desktop
+  ansible.windows.win_regedit:
+    path: HKLM:\System\CurrentControlSet\Control\Terminal Server
+    name: fDenyTSConnections
+    data: 0
+    type: dword
+
+- name: Set RDP to use Network Level Authentication
+  ansible.windows.win_regedit:
+    path: HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp
+    name: UserAuthentication
+    data: 1
+    type: dword
+
+
+# ─── Windows Update ────────────────────────────────────────────────────────────
+- name: Disable Windows Update automatic install (lab stability)
+  ansible.windows.win_regedit:
+    path: HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU
+    name: NoAutoUpdate
+    data: 1
+    type: dword
+
+- name: Disable Windows Update reboot prompts
+  ansible.windows.win_regedit:
+    path: HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU
+    name: NoAutoRebootWithLoggedOnUsers
+    data: 1
+    type: dword
+
+
+# ─── Event Logging ─────────────────────────────────────────────────────────────
+- name: Set Security event log maximum size (256 MB)
+  ansible.windows.win_powershell:
+    script: |
+      $log = Get-WinEvent -ListLog Security -ErrorAction SilentlyContinue
+      if ($log) {
+        $log.MaximumSizeInBytes = 268435456  # 256 MB
+        $log.SaveChanges()
+        Write-Output "Security log max size: 256MB"
+      }
+  ignore_errors: yes
+
+- name: Set System event log maximum size (64 MB)
+  ansible.windows.win_powershell:
+    script: |
+      $log = Get-WinEvent -ListLog System -ErrorAction SilentlyContinue
+      if ($log) {
+        $log.MaximumSizeInBytes = 67108864   # 64 MB
+        $log.SaveChanges()
+        Write-Output "System log max size: 64MB"
+      }
+  ignore_errors: yes
+
+- name: Set Application event log maximum size (64 MB)
+  ansible.windows.win_powershell:
+    script: |
+      $log = Get-WinEvent -ListLog Application -ErrorAction SilentlyContinue
+      if ($log) {
+        $log.MaximumSizeInBytes = 67108864   # 64 MB
+        $log.SaveChanges()
+        Write-Output "Application log max size: 64MB"
+      }
+  ignore_errors: yes
+
+
+# ─── Baseline registry hardening ───────────────────────────────────────────────
+- name: Disable SMBv1 client driver (common baseline – overridden on MEMBER-SERVER-01)
+  ansible.windows.win_regedit:
+    path: HKLM:\SYSTEM\CurrentControlSet\Services\mrxsmb10
+    name: Start
+    data: 4
+    type: dword
+
+- name: Enable SMB signing (client – overridden on MEMBER-SERVER-01 for MC-004)
+  ansible.windows.win_regedit:
+    path: HKLM:\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters
+    name: RequireSecuritySignature
+    data: 0       # Set to 0 baseline – MEMBER-SERVER-01 will override to confirm finding
+    type: dword
+
+- name: Set LM Authentication Level to NTLMv2 only (client)
+  ansible.windows.win_regedit:
+    path: HKLM:\SYSTEM\CurrentControlSet\Control\Lsa
+    name: LmCompatibilityLevel
+    data: 3
+    type: dword
+
+- name: Disable AutoRun for all drives
+  ansible.windows.win_regedit:
+    path: HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer
+    name: NoDriveTypeAutoRun
+    data: 255
+    type: dword
+
+- name: Set screen saver timeout (900 sec / 15 min)
+  ansible.windows.win_regedit:
+    path: HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System
+    name: InactivityTimeoutSecs
+    data: 900
+    type: dword
+
+
+# ─── Install RSAT tools (on Server SKUs) ───────────────────────────────────────
+- name: Install RSAT Active Directory tools (Server only)
+  ansible.windows.win_feature:
+    name:
+      - RSAT-AD-PowerShell
+      - RSAT-AD-Tools
+      - RSAT-DNS-Server
+      - RSAT-GPMC
+    state: present
+  when: ansible_os_name is search("Server")
+  ignore_errors: yes
+  register: rsat_install
+
+- name: Show RSAT install result
+  debug:
+    var: rsat_install
+  when: rsat_install is defined
+
+
+# ─── Verification ──────────────────────────────────────────────────────────────
+- name: Common baseline complete – show system info
+  ansible.windows.win_powershell:
+    script: |
+      $cs = Get-WmiObject Win32_ComputerSystem
+      $os = Get-WmiObject Win32_OperatingSystem
+      Write-Output "=== Common Baseline Applied ==="
+      Write-Output "  Computer : $($cs.Name)"
+      Write-Output "  OS       : $($os.Caption)"
+      Write-Output "  Version  : $($os.Version)"
+      Write-Output "  Domain   : $($cs.Domain)"
+      Write-Output "  Joined   : $($cs.PartOfDomain)"
+      Write-Output "  WinRM    : $(if ((Get-Service WinRM).Status -eq 'Running') {'Running'} else {'STOPPED'})"
+      Write-Output "  RDP      : $(if ((Get-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server').fDenyTSConnections -eq 0) {'Enabled'} else {'Disabled'})"
+  register: common_info
+
+- name: Show baseline info
+  debug:
+    var: common_info.output
