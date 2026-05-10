@@ -1,0 +1,373 @@
+---
+# =============================================================================
+# GRC Hyper-V Lab – Audit Box Playbook
+# AUDIT-BOX: Kali Linux 10.10.10.50
+# Configures the jump/audit host with all tools needed to run GRC audit scripts
+# =============================================================================
+
+- name: "[AUDIT-BOX] Configure GRC Audit Jump Host"
+  hosts: audit
+  gather_facts: yes
+  become: yes
+
+  vars:
+    audit_user: vagrant
+    audit_home: /home/vagrant
+    lab_dc_ip:  "{{ dc_primary_ip }}"
+    lab_domain: "{{ domain_name }}"
+
+  pre_tasks:
+    - name: Wait for SSH connectivity
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+        delay: 10
+
+    - name: Gather facts
+      ansible.builtin.setup:
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+  tasks:
+    # ── System packages ──────────────────────────────────────────────────────
+    - name: Install core audit and utility packages
+      ansible.builtin.apt:
+        name:
+          # Network tools
+          - nmap
+          - netcat-openbsd
+          - tcpdump
+          - curl
+          - wget
+          - dnsutils
+          - whois
+          - traceroute
+          # SMB / AD tools
+          - smbclient
+          - samba
+          - krb5-user
+          - ldap-utils
+          - winbind
+          - libnss-winbind
+          # Python and scripting
+          - python3
+          - python3-pip
+          - python3-venv
+          - python3-ldap3
+          - python3-impacket
+          # PowerShell
+          - powershell
+          # Utilities
+          - git
+          - vim
+          - tmux
+          - jq
+          - csvkit
+          - tree
+          - unzip
+          - rsync
+          - dos2unix
+        state: present
+
+    # ── Python packages for AD/WinRM audit scripting ─────────────────────────
+    - name: Install Python audit packages via pip
+      ansible.builtin.pip:
+        name:
+          - pywinrm
+          - requests-ntlm
+          - requests-kerberos
+          - ldap3
+          - impacket
+          - bloodhound
+          - crackmapexec
+          - pandas
+          - openpyxl
+          - jinja2
+          - pyyaml
+          - tabulate
+          - rich
+        executable: pip3
+        extra_args: --break-system-packages
+      ignore_errors: yes  # Some may fail on older Kali – non-fatal
+
+    # ── PowerShell modules for audit scripts ─────────────────────────────────
+    - name: Install PowerShell modules for AD auditing
+      ansible.builtin.shell: |
+        pwsh -NoProfile -Command "
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module -Name ActiveDirectoryTools -Force -Scope AllUsers -ErrorAction SilentlyContinue
+          Install-Module -Name PSWriteHTML      -Force -Scope AllUsers -ErrorAction SilentlyContinue
+          Install-Module -Name ImportExcel       -Force -Scope AllUsers -ErrorAction SilentlyContinue
+          Install-Module -Name PSReports         -Force -Scope AllUsers -ErrorAction SilentlyContinue
+          Write-Output 'PowerShell modules installed.'
+        "
+      ignore_errors: yes
+      register: pwsh_modules
+
+    - name: Show PowerShell module install result
+      debug:
+        var: pwsh_modules.stdout_lines
+      when: pwsh_modules.stdout_lines is defined
+
+    # ── /etc/hosts entries for lab ────────────────────────────────────────────
+    - name: Add lab hosts to /etc/hosts
+      ansible.builtin.blockinfile:
+        path: /etc/hosts
+        marker: "# {mark} GRC-LAB HOSTS"
+        block: |
+          10.10.10.10  dc-primary dc-primary.corp.grclab.local
+          10.10.10.11  dc-secondary dc-secondary.corp.grclab.local
+          10.10.10.20  member-server-01 member-server-01.corp.grclab.local
+          10.10.10.21  member-server-02 member-server-02.corp.grclab.local
+          10.10.10.31  workstation-win10-01 workstation-win10-01.corp.grclab.local
+          10.10.10.32  workstation-win10-02 workstation-win10-02.corp.grclab.local
+          10.10.10.33  workstation-win11 workstation-win11.corp.grclab.local
+
+    # ── Kerberos config for domain auth ──────────────────────────────────────
+    - name: Configure Kerberos for corp.grclab.local
+      ansible.builtin.copy:
+        dest: /etc/krb5.conf
+        content: |
+          [libdefaults]
+            default_realm = CORP.GRCLAB.LOCAL
+            dns_lookup_realm = false
+            dns_lookup_kdc = false
+            forwardable = true
+            ticket_lifetime = 24h
+            renew_lifetime = 7d
+
+          [realms]
+            CORP.GRCLAB.LOCAL = {
+              kdc = 10.10.10.10
+              kdc = 10.10.10.11
+              admin_server = 10.10.10.10
+            }
+
+          [domain_realm]
+            .corp.grclab.local = CORP.GRCLAB.LOCAL
+            corp.grclab.local = CORP.GRCLAB.LOCAL
+
+    # ── SMB client config ─────────────────────────────────────────────────────
+    - name: Configure SMB client (/etc/samba/smb.conf)
+      ansible.builtin.copy:
+        dest: /etc/samba/smb.conf
+        content: |
+          [global]
+            workgroup = GRCLAB
+            realm = CORP.GRCLAB.LOCAL
+            security = ADS
+            kerberos method = secrets and keytab
+            client min protocol = SMB2
+            client max protocol = SMB3
+
+    # ── Audit scripts directory structure ─────────────────────────────────────
+    - name: Create audit workspace directory tree
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ audit_user }}"
+        group: "{{ audit_user }}"
+        mode: '0755'
+      loop:
+        - "{{ audit_home }}/grc-audit"
+        - "{{ audit_home }}/grc-audit/scripts"
+        - "{{ audit_home }}/grc-audit/reports"
+        - "{{ audit_home }}/grc-audit/reports/users"
+        - "{{ audit_home }}/grc-audit/reports/groups"
+        - "{{ audit_home }}/grc-audit/reports/policy"
+        - "{{ audit_home }}/grc-audit/reports/network"
+        - "{{ audit_home }}/grc-audit/reports/patch"
+        - "{{ audit_home }}/grc-audit/evidence"
+        - "{{ audit_home }}/grc-audit/config"
+
+    # ── Copy audit scripts to audit box ──────────────────────────────────────
+    - name: Copy PowerShell audit scripts
+      ansible.builtin.copy:
+        src:  "{{ playbook_dir }}/../../scripts/audit-targets/"
+        dest: "{{ audit_home }}/grc-audit/scripts/"
+        owner: "{{ audit_user }}"
+        group: "{{ audit_user }}"
+        mode: '0755'
+      ignore_errors: yes  # Scripts may not exist yet during initial build
+
+    # ── WinRM connectivity config for audit scripts ───────────────────────────
+    - name: Write WinRM config file for PowerShell audit scripts
+      ansible.builtin.copy:
+        dest: "{{ audit_home }}/grc-audit/config/lab-targets.json"
+        owner: "{{ audit_user }}"
+        group: "{{ audit_user }}"
+        mode: '0600'
+        content: |
+          {
+            "domain": "corp.grclab.local",
+            "netbios": "GRCLAB",
+            "domain_controllers": [
+              { "name": "DC-PRIMARY",   "ip": "10.10.10.10", "role": "primary" },
+              { "name": "DC-SECONDARY", "ip": "10.10.10.11", "role": "secondary" }
+            ],
+            "member_servers": [
+              { "name": "MEMBER-SERVER-01", "ip": "10.10.10.20", "role": "fileserver" },
+              { "name": "MEMBER-SERVER-02", "ip": "10.10.10.21", "role": "webserver" }
+            ],
+            "workstations": [
+              { "name": "WORKSTATION-WIN10-01", "ip": "10.10.10.31", "os": "win10" },
+              { "name": "WORKSTATION-WIN10-02", "ip": "10.10.10.32", "os": "win10" },
+              { "name": "WORKSTATION-WIN11",    "ip": "10.10.10.33", "os": "win11" }
+            ],
+            "credentials": {
+              "domain_admin": "GRCLAB\\Administrator",
+              "winrm_transport": "ntlm",
+              "note": "Do not store real credentials here in production"
+            }
+          }
+
+    # ── Helper shell scripts ──────────────────────────────────────────────────
+    - name: Write audit runner helper script
+      ansible.builtin.copy:
+        dest: "{{ audit_home }}/grc-audit/run-all-audits.sh"
+        owner: "{{ audit_user }}"
+        group: "{{ audit_user }}"
+        mode: '0755'
+        content: |
+          #!/usr/bin/env bash
+          # GRC Lab – Run all PowerShell audit scripts against the domain
+          set -euo pipefail
+
+          DC="10.10.10.10"
+          TARGETS="10.10.10.10 10.10.10.11 10.10.10.20 10.10.10.21"
+          REPORT_DIR="$HOME/grc-audit/reports/$(date +%Y%m%d-%H%M)"
+          SCRIPTS_DIR="$HOME/grc-audit/scripts"
+
+          mkdir -p "$REPORT_DIR"
+          echo "[*] GRC Audit Run started: $(date)"
+          echo "[*] Reports will be saved to: $REPORT_DIR"
+
+          echo "[*] Running AD User Audit..."
+          pwsh -NonInteractive -File "$SCRIPTS_DIR/Get-ADUserAudit.ps1" \
+            -DomainController "$DC" \
+            -OutputPath "$REPORT_DIR/ad-user-audit.csv" \
+            -StaleThresholdDays 90 2>&1 | tee "$REPORT_DIR/ad-user-audit.log"
+
+          echo "[*] Running Privileged Group Audit..."
+          pwsh -NonInteractive -File "$SCRIPTS_DIR/Get-PrivilegedGroups.ps1" \
+            -DomainController "$DC" \
+            -OutputPath "$REPORT_DIR/privileged-groups.csv" 2>&1 | tee "$REPORT_DIR/priv-groups.log"
+
+          echo "[*] Running Password Policy Check..."
+          pwsh -NonInteractive -File "$SCRIPTS_DIR/Get-PasswordPolicy.ps1" \
+            -DomainController "$DC" \
+            -CheckBitLocker 2>&1 | tee "$REPORT_DIR/password-policy.log"
+
+          echo "[*] Running GPO Report..."
+          pwsh -NonInteractive -File "$SCRIPTS_DIR/Get-GPOReport.ps1" \
+            -DomainController "$DC" \
+            -OutputDir "$REPORT_DIR/gpo-reports" 2>&1 | tee "$REPORT_DIR/gpo-report.log"
+
+          echo "[*] Running Audit Policy Check..."
+          pwsh -NonInteractive -File "$SCRIPTS_DIR/Get-AuditPolicy.ps1" \
+            -TargetHosts "10.10.10.10","10.10.10.11" \
+            -OutputPath "$REPORT_DIR/audit-policy.csv" 2>&1 | tee "$REPORT_DIR/audit-policy.log"
+
+          echo "[*] Running SMB / Network Config Audit..."
+          pwsh -NonInteractive -File "$SCRIPTS_DIR/Get-SMBConfig.ps1" \
+            -TargetHosts $TARGETS \
+            -CheckNullSessions \
+            -CheckWinRM \
+            -OutputPath "$REPORT_DIR/smb-config.csv" 2>&1 | tee "$REPORT_DIR/smb-config.log"
+
+          echo "[*] Running Service Account Audit..."
+          pwsh -NonInteractive -File "$SCRIPTS_DIR/Get-ServiceAccounts.ps1" \
+            -DomainController "$DC" \
+            -OutputPath "$REPORT_DIR/service-accounts.csv" 2>&1 | tee "$REPORT_DIR/svc-accounts.log"
+
+          echo ""
+          echo "========================================"
+          echo "[DONE] All audit scripts complete."
+          echo "Reports in: $REPORT_DIR"
+          echo "========================================"
+          ls -lh "$REPORT_DIR"
+
+    # ── DNS resolver config ───────────────────────────────────────────────────
+    - name: Configure resolv.conf to use domain controllers
+      ansible.builtin.copy:
+        dest: /etc/resolv.conf
+        content: |
+          # GRC Lab – DNS configuration
+          domain corp.grclab.local
+          search corp.grclab.local grclab.local
+          nameserver 10.10.10.10
+          nameserver 10.10.10.11
+          nameserver 8.8.8.8
+
+    # ── Profile / motd ────────────────────────────────────────────────────────
+    - name: Write lab MOTD
+      ansible.builtin.copy:
+        dest: /etc/motd
+        content: |
+
+          ╔══════════════════════════════════════════════════════════════╗
+          ║           GRC Hyper-V Lab – Audit Box (AUDIT-BOX)           ║
+          ║                  corp.grclab.local  |  10.10.10.50           ║
+          ╠══════════════════════════════════════════════════════════════╣
+          ║  DC-PRIMARY        10.10.10.10  (PDC / FSMO)                ║
+          ║  DC-SECONDARY      10.10.10.11  (Replica DC)                ║
+          ║  MEMBER-SERVER-01  10.10.10.20  (File Server)               ║
+          ║  MEMBER-SERVER-02  10.10.10.21  (IIS Web Server)            ║
+          ║  WORKSTATION-*     10.10.10.31-33                           ║
+          ╠══════════════════════════════════════════════════════════════╣
+          ║  Audit Scripts:  ~/grc-audit/scripts/                       ║
+          ║  Run All:        ~/grc-audit/run-all-audits.sh              ║
+          ║  Reports:        ~/grc-audit/reports/                       ║
+          ╚══════════════════════════════════════════════════════════════╝
+
+          ⚠  This lab contains intentional misconfigurations for GRC testing.
+             Do NOT expose to production networks.
+
+    - name: Write bash aliases for audit convenience
+      ansible.builtin.blockinfile:
+        path: "{{ audit_home }}/.bashrc"
+        marker: "# {mark} GRC LAB ALIASES"
+        block: |
+          # GRC Lab shortcuts
+          alias dc1='pwsh -NonInteractive -Command "Enter-PSSession -ComputerName 10.10.10.10 -Credential GRCLAB\\Administrator -Authentication Negotiate"'
+          alias dc2='pwsh -NonInteractive -Command "Enter-PSSession -ComputerName 10.10.10.11 -Credential GRCLAB\\Administrator -Authentication Negotiate"'
+          alias run-audit='bash ~/grc-audit/run-all-audits.sh'
+          alias audit-reports='ls -lh ~/grc-audit/reports/'
+          alias lab-targets='cat ~/grc-audit/config/lab-targets.json | jq .'
+          alias smb-enum='smbclient -L 10.10.10.10 -U GRCLAB\\Administrator'
+
+          # Quick nmap of lab subnet
+          alias lab-scan='nmap -sn 10.10.10.0/24'
+
+    # ── Final connectivity test ───────────────────────────────────────────────
+    - name: Test DNS resolution of domain controllers
+      ansible.builtin.shell: |
+        host dc-primary.corp.grclab.local 10.10.10.10 || true
+        nslookup corp.grclab.local 10.10.10.10 || true
+      register: dns_test
+      ignore_errors: yes
+
+    - name: Show DNS test results
+      debug:
+        var: dns_test.stdout_lines
+
+    - name: Test WinRM connectivity to DC-PRIMARY
+      ansible.builtin.shell: |
+        nc -zv -w5 10.10.10.10 5985 && echo "WinRM port open" || echo "WinRM port closed"
+      register: winrm_test
+      ignore_errors: yes
+
+    - name: Show WinRM test
+      debug:
+        var: winrm_test.stdout
+
+    - name: Audit Box setup complete
+      debug:
+        msg: |
+          ✓ AUDIT-BOX configuration complete.
+          ✓ Audit scripts: ~/grc-audit/scripts/
+          ✓ Run all:       ~/grc-audit/run-all-audits.sh
+          ✓ PowerShell:    pwsh (available globally)
+          ✓ Tools:         nmap, smbclient, ldap-utils, impacket, crackmapexec
