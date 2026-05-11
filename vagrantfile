@@ -5,32 +5,25 @@
 #
 # NETWORKING DESIGN
 # ─────────────────
-# Phase 1 – Bootstrap (two NICs):
-#   NIC 1 → "Default Switch"  (Hyper-V built-in, NAT + DHCP)
-#            Vagrant uses this DHCP address for its initial WinRM/SSH
-#            connection and to run provisioners. Internet access here.
-#   NIC 2 → "GRC-Lab-Switch"  (internal switch, no DHCP)
-#            Bootstrap sets the static 10.10.10.x IP on this adapter.
+# Hyper-V internal switches have no DHCP. Two-phase approach per VM:
 #
-# Phase 2 – Disconnect (one NIC):
-#   After the static IP and WinRM are confirmed working on NIC 2,
-#   a host-side PowerShell provisioner disconnects NIC 1 from the
-#   Default Switch using Hyper-V cmdlets (Remove-VMNetworkAdapter).
-#   The VM is then rebooted. From this point the VM is only reachable
-#   on its 10.10.10.x address — isolated to the lab network.
+# Phase 1 (inside VM via Default Switch DHCP):
+#   - Vagrant connects over Default Switch (Hyper-V built-in, has NAT+DHCP)
+#   - Bootstrap provisioner sets static IP on the GRC-Lab-Switch adapter
+#   - WinRM opened on all adapters
 #
-#   Ansible (running from AUDIT-BOX) connects exclusively over the
-#   static 10.10.10.x addresses, so it is unaffected by the disconnect.
+# Phase 2 (on Windows host via Hyper-V PowerShell):
+#   - Host-side shell provisioner removes the Default Switch NIC from the VM
+#   - vagrant-reload reboots the VM
+#   - VM is now ONLY on GRC-Lab-Switch (10.10.10.x) — isolated to lab network
 #
-# Boot order:
-#   1-7. Windows VMs + AUDIT-BOX bootstrap (both NICs, set static IP)
-#   8.   Each VM's management NIC is disconnected via host-side PS
-#   9.   AUDIT-BOX ansible_local runs using only static IPs
+# After Phase 2, Ansible (on AUDIT-BOX) talks to all VMs on static lab IPs.
 #
-# Windows host prerequisites:
-#   - Hyper-V enabled ("Default Switch" is always present)
+# Prerequisites on Windows host:
+#   - Hyper-V enabled (Default Switch is always present)
 #   - GRC-Lab-Switch created: .\scripts\setup\create-hyperv-switch.ps1
-#   - Vagrant >= 2.4 + vagrant-reload plugin installed
+#   - Vagrant >= 2.4
+#   - vagrant plugin install vagrant-reload
 #   - Git
 # =============================================================================
 
@@ -47,241 +40,189 @@ MACHINES = [
   { name: "MEMBER-SERVER-02",    box: "gusztavvargadr/windows-server-2019-standard", ip: "10.10.10.21", ram: 4096, cpus: 2 },
   { name: "WORKSTATION-WIN10-01",box: "gusztavvargadr/windows-10-enterprise",        ip: "10.10.10.31", ram: 4096, cpus: 2 },
   { name: "WORKSTATION-WIN10-02",box: "gusztavvargadr/windows-10-enterprise",        ip: "10.10.10.32", ram: 4096, cpus: 2 },
-  { name: "WORKSTATION-WIN11",   box: "gusztavvargadr/windows-11-22h2-enterprise",        ip: "10.10.10.33", ram: 4096, cpus: 2 },
+  { name: "WORKSTATION-WIN11",   box: "gusztavvargadr/windows-11-enterprise",        ip: "10.10.10.33", ram: 4096, cpus: 2 },
   { name: "AUDIT-BOX",           box: "kalilinux/rolling",                           ip: "10.10.10.50", ram: 4096, cpus: 2 },
 ].freeze
 
 # =============================================================================
-# PHASE 1 BOOTSTRAP – Windows
-# Runs inside the VM over WinRM via NIC1 (Default Switch).
-# Sets static IP on NIC2 (GRC-Lab-Switch) and opens WinRM on all adapters.
-# Does NOT disconnect NIC1 yet — Vagrant still needs it for Phase 2.
+# Helper: Phase 1 Windows bootstrap script (runs inside VM over WinRM)
+# Finds the GRC-Lab-Switch NIC (no IP / APIPA) and sets the static lab IP.
+# Constants passed as plain string arguments to avoid Ruby scope issues.
 # =============================================================================
-def win_bootstrap(static_ip)
-  <<~PS
-    Write-Host ""
-    Write-Host "=== [Phase 1] Bootstrap: #{static_ip} ===" -ForegroundColor Cyan
-
-    # ── Identify NIC2 (GRC-Lab-Switch adapter) ───────────────────────────────
-    # NIC1 has the DHCP address Vagrant is using right now.
-    # NIC2 has no IPv4 address yet, or only an APIPA (169.254.x.x).
-    $labAdapter = $null
-    $attempts   = 0
-    while (-not $labAdapter -and $attempts -lt 20) {
-      Start-Sleep -Seconds 3
-      $attempts++
-      foreach ($a in (Get-NetAdapter | Where-Object Status -eq 'Up')) {
-        $ips = (Get-NetIPAddress -InterfaceIndex $a.ifIndex `
-                  -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress
-        if (-not $ips -or ($ips | Where-Object { $_ -like '169.254.*' })) {
-          $labAdapter = $a
-          break
-        }
-      }
-    }
-
-    if (-not $labAdapter) {
-      # Fallback: highest interface index = last NIC added = lab NIC
-      $labAdapter = Get-NetAdapter | Where-Object Status -eq 'Up' |
-                    Sort-Object ifIndex -Descending | Select-Object -First 1
-      Write-Warning "  Fallback to adapter: $($labAdapter.Name)"
-    }
-
-    Write-Host "  Lab NIC : $($labAdapter.Name) ($($labAdapter.InterfaceDescription))"
-
-    # ── Set static IP on NIC2 ────────────────────────────────────────────────
-    Get-NetIPAddress -InterfaceIndex $labAdapter.ifIndex -AddressFamily IPv4 `
-      -ErrorAction SilentlyContinue |
-      Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
-
-    Get-NetRoute -InterfaceIndex $labAdapter.ifIndex -ErrorAction SilentlyContinue |
-      Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
-
-    # No default gateway on NIC2 — routing to the internet stays on NIC1
-    # for now and disappears when NIC1 is removed in Phase 2.
-    New-NetIPAddress `
-      -InterfaceIndex $labAdapter.ifIndex `
-      -IPAddress      "#{static_ip}" `
-      -PrefixLength   #{PREFIX_LEN} `
-      -ErrorAction    Stop | Out-Null
-
-    # Temporary DNS — Ansible will reconfigure after domain promotion
-    Set-DnsClientServerAddress `
-      -InterfaceIndex $labAdapter.ifIndex `
-      -ServerAddresses @("10.10.10.10", "10.10.10.11") | Out-Null
-
-    Write-Host "  Lab IP  : #{static_ip}/#{PREFIX_LEN} configured on $($labAdapter.Name)"
-
-    # ── Open WinRM on all adapters (including the new lab IP) ────────────────
-    Set-ExecutionPolicy Unrestricted -Scope LocalMachine -Force
-    winrm quickconfig -q 2>&1 | Out-Null
-    winrm set winrm/config              '@{MaxTimeoutms="300000"}'       2>&1 | Out-Null
-    winrm set winrm/config/service      '@{AllowUnencrypted="true"}'     2>&1 | Out-Null
-    winrm set winrm/config/service/auth '@{Basic="true"}'                2>&1 | Out-Null
-    winrm set winrm/config/service/auth '@{Negotiate="true"}'            2>&1 | Out-Null
-    winrm set winrm/config/winrs        '@{MaxMemoryPerShellMB="1024"}'  2>&1 | Out-Null
-
-    Get-NetFirewallRule -Name 'WinRM-HTTP-GRC' -ErrorAction SilentlyContinue |
-      Remove-NetFirewallRule
-    New-NetFirewallRule `
-      -Name        'WinRM-HTTP-GRC' `
-      -DisplayName 'WinRM HTTP (GRC Lab)' `
-      -Protocol TCP -LocalPort 5985 `
-      -Action Allow -Direction Inbound -Profile Any | Out-Null
-
-    # ICMP (ping) and RDP
-    Enable-NetFirewallRule `
-      -DisplayName 'File and Printer Sharing (Echo Request - ICMPv4-In)' `
-      -ErrorAction SilentlyContinue
-    Set-ItemProperty `
-      -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-      -Name fDenyTSConnections -Value 0
-    Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
-
-    # ── Confirm WinRM is reachable on the lab IP before we continue ───────────
-    Write-Host "  Verifying WinRM on lab IP #{static_ip}:5985..."
-    $testResult = Test-NetConnection -ComputerName "#{static_ip}" -Port 5985 -WarningAction SilentlyContinue
-    if ($testResult.TcpTestSucceeded) {
-      Write-Host "  WinRM on lab IP: REACHABLE" -ForegroundColor Green
-    } else {
-      Write-Warning "  WinRM on lab IP: not yet reachable (Phase 2 will retry)"
-    }
-
-    Write-Host "=== [Phase 1] Complete ===" -ForegroundColor Cyan
-  PS
+def win_bootstrap(static_ip, prefix_len)
+  script = ""
+  script << "Write-Host ''\n"
+  script << "Write-Host '=== [Phase 1] Bootstrap: " + static_ip + " ===' -ForegroundColor Cyan\n"
+  script << "\n"
+  script << "# Find NIC2 (GRC-Lab-Switch) -- it has no IP or only APIPA\n"
+  script << "$labAdapter = $null\n"
+  script << "$attempts   = 0\n"
+  script << "while (-not $labAdapter -and $attempts -lt 20) {\n"
+  script << "  Start-Sleep -Seconds 3\n"
+  script << "  $attempts++\n"
+  script << "  foreach ($a in (Get-NetAdapter | Where-Object Status -eq 'Up')) {\n"
+  script << "    $ips = (Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress\n"
+  script << "    if (-not $ips -or ($ips | Where-Object { $_ -like '169.254.*' })) {\n"
+  script << "      $labAdapter = $a\n"
+  script << "      break\n"
+  script << "    }\n"
+  script << "  }\n"
+  script << "}\n"
+  script << "\n"
+  script << "if (-not $labAdapter) {\n"
+  script << "  $labAdapter = Get-NetAdapter | Where-Object Status -eq 'Up' | Sort-Object ifIndex -Descending | Select-Object -First 1\n"
+  script << "  Write-Warning '  Fallback adapter: ' + $labAdapter.Name\n"
+  script << "}\n"
+  script << "\n"
+  script << "Write-Host '  Lab NIC: ' + $labAdapter.Name + ' (' + $labAdapter.InterfaceDescription + ')'\n"
+  script << "\n"
+  script << "# Clear any existing IP config on NIC2\n"
+  script << "Get-NetIPAddress -InterfaceIndex $labAdapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue\n"
+  script << "Get-NetRoute -InterfaceIndex $labAdapter.ifIndex -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue\n"
+  script << "\n"
+  script << "# Set static lab IP -- no default gateway on NIC2 (internet stays on NIC1 until it's removed)\n"
+  script << "New-NetIPAddress -InterfaceIndex $labAdapter.ifIndex -IPAddress '" + static_ip + "' -PrefixLength " + prefix_len.to_s + " -ErrorAction Stop | Out-Null\n"
+  script << "\n"
+  script << "# Temporary DNS pointing at lab DCs\n"
+  script << "Set-DnsClientServerAddress -InterfaceIndex $labAdapter.ifIndex -ServerAddresses @('10.10.10.10','10.10.10.11') | Out-Null\n"
+  script << "\n"
+  script << "Write-Host '  Lab IP: " + static_ip + "/" + prefix_len.to_s + " set on ' + $labAdapter.Name\n"
+  script << "\n"
+  script << "# Configure WinRM\n"
+  script << "Set-ExecutionPolicy Unrestricted -Scope LocalMachine -Force\n"
+  script << "winrm quickconfig -q 2>&1 | Out-Null\n"
+  script << "winrm set winrm/config              '@{MaxTimeoutms=\"300000\"}'      2>&1 | Out-Null\n"
+  script << "winrm set winrm/config/service      '@{AllowUnencrypted=\"true\"}'    2>&1 | Out-Null\n"
+  script << "winrm set winrm/config/service/auth '@{Basic=\"true\"}'               2>&1 | Out-Null\n"
+  script << "winrm set winrm/config/service/auth '@{Negotiate=\"true\"}'           2>&1 | Out-Null\n"
+  script << "winrm set winrm/config/winrs        '@{MaxMemoryPerShellMB=\"1024\"}' 2>&1 | Out-Null\n"
+  script << "\n"
+  script << "Get-NetFirewallRule -Name 'WinRM-HTTP-GRC' -ErrorAction SilentlyContinue | Remove-NetFirewallRule\n"
+  script << "New-NetFirewallRule -Name 'WinRM-HTTP-GRC' -DisplayName 'WinRM HTTP (GRC Lab)' -Protocol TCP -LocalPort 5985 -Action Allow -Direction Inbound -Profile Any | Out-Null\n"
+  script << "\n"
+  script << "# ICMP and RDP\n"
+  script << "Enable-NetFirewallRule -DisplayName 'File and Printer Sharing (Echo Request - ICMPv4-In)' -ErrorAction SilentlyContinue\n"
+  script << "Set-ItemProperty -Path 'HKLM:\\System\\CurrentControlSet\\Control\\Terminal Server' -Name fDenyTSConnections -Value 0\n"
+  script << "Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue\n"
+  script << "\n"
+  script << "Write-Host '=== [Phase 1] Complete ===' -ForegroundColor Cyan\n"
+  script
 end
 
 # =============================================================================
-# PHASE 2 DISCONNECT – runs on the Windows HOST via a local shell provisioner
+# Helper: Phase 2 disconnect script (runs on the Windows HOST, not in VM)
 # Uses Hyper-V PowerShell to remove the Default Switch NIC from the VM.
-# Then vagrant-reload reboots the VM cleanly.
-# After reboot the VM is ONLY on GRC-Lab-Switch (10.10.10.x).
 # =============================================================================
-def disconnect_mgmt_nic(vm_name, static_ip)
-  <<~PS
-    Write-Host ""
-    Write-Host "=== [Phase 2] Disconnecting Default Switch NIC from #{vm_name} ===" -ForegroundColor Cyan
-
-    $vmName     = "#{vm_name}"
-    $mgmtSwitch = "#{MGMT_SWITCH}"
-    $labIP      = "#{static_ip}"
-
-    # Find the NIC connected to the Default Switch
-    $mgmtNic = Get-VMNetworkAdapter -VMName $vmName |
-      Where-Object { $_.SwitchName -eq $mgmtSwitch }
-
-    if ($mgmtNic) {
-      Write-Host "  Removing NIC '$($mgmtNic.Name)' (connected to '$mgmtSwitch')..."
-      Remove-VMNetworkAdapter -VMName $vmName -VMNetworkAdapterName $mgmtNic.Name
-      Write-Host "  Management NIC removed." -ForegroundColor Green
-    } else {
-      Write-Host "  No '$mgmtSwitch' NIC found — already disconnected or not present." -ForegroundColor Yellow
-    }
-
-    # Confirm only the lab NIC remains
-    $remaining = Get-VMNetworkAdapter -VMName $vmName
-    Write-Host "  Remaining NICs on #{vm_name}:"
-    $remaining | ForEach-Object {
-      Write-Host "    - $($_.Name) -> $($_.SwitchName)"
-    }
-
-    Write-Host "  #{vm_name} is now isolated to GRC-Lab-Switch ($labIP)"
-    Write-Host "=== [Phase 2] Complete ===" -ForegroundColor Cyan
-  PS
+def disconnect_mgmt_nic(vm_name, static_ip, mgmt_switch)
+  script = ""
+  script << "Write-Host ''\n"
+  script << "Write-Host '=== [Phase 2] Removing Default Switch NIC from " + vm_name + " ===' -ForegroundColor Cyan\n"
+  script << "\n"
+  script << "$mgmtNic = Get-VMNetworkAdapter -VMName '" + vm_name + "' | Where-Object { $_.SwitchName -eq '" + mgmt_switch + "' }\n"
+  script << "\n"
+  script << "if ($mgmtNic) {\n"
+  script << "  Write-Host '  Removing: ' + $mgmtNic.Name + ' -> ' + $mgmtNic.SwitchName\n"
+  script << "  Remove-VMNetworkAdapter -VMName '" + vm_name + "' -VMNetworkAdapterName $mgmtNic.Name\n"
+  script << "  Write-Host '  Management NIC removed.' -ForegroundColor Green\n"
+  script << "} else {\n"
+  script << "  Write-Host '  No Default Switch NIC found -- already removed or not present.' -ForegroundColor Yellow\n"
+  script << "}\n"
+  script << "\n"
+  script << "Write-Host '  Remaining NICs on " + vm_name + ":'\n"
+  script << "Get-VMNetworkAdapter -VMName '" + vm_name + "' | ForEach-Object { Write-Host '    -' $_.Name '->' $_.SwitchName }\n"
+  script << "Write-Host '  " + vm_name + " is now isolated to GRC-Lab-Switch (" + static_ip + ")'\n"
+  script << "Write-Host '=== [Phase 2] Complete ===' -ForegroundColor Cyan\n"
+  script
 end
 
 # =============================================================================
-# PHASE 1 BOOTSTRAP – Linux (AUDIT-BOX)
-# Sets static IP on NIC2, then disconnects NIC1 via host PowerShell.
+# Helper: Phase 1 Linux bootstrap (runs inside AUDIT-BOX via SSH)
+# Sets static IP on the GRC-Lab-Switch NIC using nmcli.
+# NOTE: Uses string concatenation to avoid heredoc-inside-heredoc issues.
 # =============================================================================
-def linux_bootstrap(static_ip)
-  <<~BASH
-    #!/usr/bin/env bash
-    set -euo pipefail
-    echo ""
-    echo "=== [Phase 1] Bootstrap: #{static_ip} ==="
-
-    # Find NIC2 — the interface with no IP or only APIPA
-    LAB_NIC=""
-    for iface in $(ls /sys/class/net | grep -v lo | sort); do
-      addr=$(ip -4 addr show "$iface" 2>/dev/null | awk '/inet /{print $2}' | head -1)
-      if [ -z "$addr" ] || echo "$addr" | grep -q '^169\\.254\\.'; then
-        LAB_NIC="$iface"
-        break
-      fi
-    done
-
-    if [ -z "$LAB_NIC" ]; then
-      LAB_NIC=$(ls /sys/class/net | grep -v lo | sort | tail -1)
-      echo "  Fallback NIC: $LAB_NIC"
-    fi
-
-    echo "  Lab NIC: $LAB_NIC"
-
-    # Set static IP using nmcli (Kali default) or ip/interfaces fallback
-    if command -v nmcli &>/dev/null; then
-      nmcli connection delete "grc-lab-static" 2>/dev/null || true
-      nmcli connection add type ethernet ifname "$LAB_NIC" con-name "grc-lab-static" \
-        ipv4.method   manual                         \
-        ipv4.addresses "#{static_ip}/#{PREFIX_LEN}"  \
-        ipv4.dns       "10.10.10.10,10.10.10.11"     \
-        ipv6.method    disabled
-      nmcli connection up "grc-lab-static"
-      echo "  Static IP set via nmcli: #{static_ip}/#{PREFIX_LEN}"
-    else
-      ip addr flush dev "$LAB_NIC" 2>/dev/null || true
-      ip addr add "#{static_ip}/#{PREFIX_LEN}" dev "$LAB_NIC"
-      ip link set "$LAB_NIC" up
-      cat >> /etc/network/interfaces <<EOF
-
-auto $LAB_NIC
-iface $LAB_NIC inet static
-  address #{static_ip}
-  netmask 255.255.255.0
-  dns-nameservers 10.10.10.10 10.10.10.11
-EOF
-      echo "  Static IP set via ip command: #{static_ip}/#{PREFIX_LEN}"
-    fi
-
-    # Point resolv.conf at the lab DCs
-    grep -q "10.10.10.10" /etc/resolv.conf || echo "nameserver 10.10.10.10" >> /etc/resolv.conf
-    grep -q "10.10.10.11" /etc/resolv.conf || echo "nameserver 10.10.10.11" >> /etc/resolv.conf
-
-    echo "=== [Phase 1] Complete ==="
-  BASH
+def linux_bootstrap(static_ip, prefix_len)
+  script = ""
+  script << "#!/usr/bin/env bash\n"
+  script << "set -euo pipefail\n"
+  script << "echo ''\n"
+  script << "echo '=== [Phase 1] Bootstrap: " + static_ip + " ==='\n"
+  script << "\n"
+  script << "# Find NIC2 -- the adapter with no IP or only APIPA\n"
+  script << "LAB_NIC=''\n"
+  script << "for iface in $(ls /sys/class/net | grep -v lo | sort); do\n"
+  script << "  addr=$(ip -4 addr show \"$iface\" 2>/dev/null | awk '/inet /{print $2}' | head -1)\n"
+  script << "  if [ -z \"$addr\" ] || echo \"$addr\" | grep -q '^169\\.254\\.'; then\n"
+  script << "    LAB_NIC=\"$iface\"\n"
+  script << "    break\n"
+  script << "  fi\n"
+  script << "done\n"
+  script << "\n"
+  script << "if [ -z \"$LAB_NIC\" ]; then\n"
+  script << "  LAB_NIC=$(ls /sys/class/net | grep -v lo | sort | tail -1)\n"
+  script << "  echo \"  Fallback NIC: $LAB_NIC\"\n"
+  script << "fi\n"
+  script << "echo \"  Lab NIC: $LAB_NIC\"\n"
+  script << "\n"
+  script << "# Set static IP via nmcli (Kali default) or fall back to ip command\n"
+  script << "if command -v nmcli &>/dev/null; then\n"
+  script << "  nmcli connection delete 'grc-lab-static' 2>/dev/null || true\n"
+  script << "  nmcli connection add type ethernet ifname \"$LAB_NIC\" con-name 'grc-lab-static' \\\n"
+  script << "    ipv4.method manual \\\n"
+  script << "    ipv4.addresses '" + static_ip + "/" + prefix_len.to_s + "' \\\n"
+  script << "    ipv4.dns '10.10.10.10,10.10.10.11' \\\n"
+  script << "    ipv6.method disabled\n"
+  script << "  nmcli connection up 'grc-lab-static'\n"
+  script << "  echo '  Static IP set via nmcli: " + static_ip + "/" + prefix_len.to_s + "'\n"
+  script << "else\n"
+  script << "  ip addr flush dev \"$LAB_NIC\" 2>/dev/null || true\n"
+  script << "  ip addr add '" + static_ip + "/" + prefix_len.to_s + "' dev \"$LAB_NIC\"\n"
+  script << "  ip link set \"$LAB_NIC\" up\n"
+  script << "  printf '\\nauto %s\\niface %s inet static\\n  address " + static_ip + "\\n  netmask 255.255.255.0\\n  dns-nameservers 10.10.10.10 10.10.10.11\\n' \"$LAB_NIC\" \"$LAB_NIC\" >> /etc/network/interfaces\n"
+  script << "  echo '  Static IP set via ip command: " + static_ip + "/" + prefix_len.to_s + "'\n"
+  script << "fi\n"
+  script << "\n"
+  script << "grep -q '10.10.10.10' /etc/resolv.conf || echo 'nameserver 10.10.10.10' >> /etc/resolv.conf\n"
+  script << "grep -q '10.10.10.11' /etc/resolv.conf || echo 'nameserver 10.10.10.11' >> /etc/resolv.conf\n"
+  script << "\n"
+  script << "echo '=== [Phase 1] Complete ==='\n"
+  script
 end
 
 # =============================================================================
 Vagrant.configure("2") do |config|
 
+  # Disable SMB synced folders globally -- no credential prompts
   config.vm.synced_folder ".", "/vagrant", disabled: true
 
+  # Global Hyper-V provider settings
   config.vm.provider "hyperv" do |h|
     h.enable_virtualization_extensions = true
     h.linked_clone                     = true
     h.vm_integration_services          = { guest_service_interface: true }
   end
 
-  MACHINES.each do |vm|
-    config.vm.define vm[:name] do |m|
+  MACHINES.each do |vm_cfg|
+    config.vm.define vm_cfg[:name] do |m|
 
-      m.vm.box      = vm[:box]
-      m.vm.hostname = vm[:name].downcase
+      m.vm.box      = vm_cfg[:box]
+      m.vm.hostname = vm_cfg[:name].downcase
       m.vm.synced_folder ".", "/vagrant", disabled: true
 
-      # NIC 2: GRC-Lab-Switch (NIC 1 / Default Switch is implicit)
+      # NIC 2: GRC-Lab-Switch
+      # NIC 1 (Default Switch) is implicit -- Hyper-V attaches it automatically
       m.vm.network "private_network", bridge: LAB_SWITCH
 
       m.vm.provider "hyperv" do |h|
-        h.vmname    = vm[:name]
-        h.memory    = vm[:ram]
-        h.maxmemory = vm[:ram]
-        h.cpus      = vm[:cpus]
+        h.vmname    = vm_cfg[:name]
+        h.memory    = vm_cfg[:ram]
+        h.maxmemory = vm_cfg[:ram]
+        h.cpus      = vm_cfg[:cpus]
       end
 
-      # ── Windows VMs ──────────────────────────────────────────────────────────
-      if vm[:name] != "AUDIT-BOX"
+      # ── Windows VMs ────────────────────────────────────────────────────────
+      if vm_cfg[:name] != "AUDIT-BOX"
 
+        # Vagrant connects via NIC1 (Default Switch DHCP) automatically
         m.vm.communicator       = "winrm"
         m.winrm.username        = "vagrant"
         m.winrm.password        = "vagrant"
@@ -290,83 +231,70 @@ Vagrant.configure("2") do |config|
         m.winrm.timeout         = 300
         m.winrm.retry_limit     = 20
 
-        # Phase 1: set static lab IP + open WinRM (runs inside VM via NIC1)
+        # Phase 1: set static lab IP on NIC2 + open WinRM (runs inside VM)
         m.vm.provision "shell",
-          name:   "Phase 1 – Set Static Lab IP + WinRM",
-          inline: win_bootstrap(vm[:ip]),
+          name:                            "Phase 1 - Set Static Lab IP and WinRM",
+          inline:                          win_bootstrap(vm_cfg[:ip], PREFIX_LEN),
           powershell_elevated_interactive: false
 
-        # Push AD population script to DC-PRIMARY before Phase 2 disconnects NIC1
-        if vm[:name] == "DC-PRIMARY"
-          script_path = File.join(File.dirname(__FILE__),
-                                  "scripts/setup/Invoke-ADLabPopulate.ps1")
+        # Upload AD population script to DC-PRIMARY while NIC1 is still up
+        if vm_cfg[:name] == "DC-PRIMARY"
+          script_path = File.join(File.dirname(__FILE__), "scripts/setup/Invoke-ADLabPopulate.ps1")
           if File.exist?(script_path)
             ad_script = File.read(script_path)
+            # Escape any single quotes in the script for the PowerShell here-string
+            ad_script_escaped = ad_script.gsub("'@", "''@")
             m.vm.provision "shell",
-              name:   "Upload AD Population Script",
-              inline: <<~PS,
-                $dest = 'C:\\Windows\\Temp\\Invoke-ADLabPopulate.ps1'
-                Set-Content -Path $dest -Encoding UTF8 -Value @'
-                #{ad_script}
-                '@
-                Write-Host "[upload] AD population script written to $dest"
-              PS
+              name:                            "Upload AD Population Script",
+              inline:                          "$dest = 'C:\\Windows\\Temp\\Invoke-ADLabPopulate.ps1'\nSet-Content -Path $dest -Encoding UTF8 -Value @'\n" + ad_script_escaped + "\n'@\nWrite-Host '[upload] AD population script written to ' + $dest\n",
               powershell_elevated_interactive: false
           else
-            puts "WARNING: scripts/setup/Invoke-ADLabPopulate.ps1 not found — skipping upload"
+            puts "WARNING: scripts/setup/Invoke-ADLabPopulate.ps1 not found - skipping upload"
           end
         end
 
-        # Phase 2: disconnect Default Switch NIC — runs on the HOST via
-        # local PowerShell (privileged: false means it runs locally, not
-        # inside the VM). This uses Hyper-V cmdlets available on the host.
+        # Phase 2: remove Default Switch NIC -- runs on the WINDOWS HOST
+        # (privileged: false on a Windows host shell = runs in host PowerShell)
         m.vm.provision "shell",
-          name:       "Phase 2 – Disconnect Default Switch NIC",
+          name:       "Phase 2 - Disconnect Default Switch NIC",
           privileged: false,
-          inline:     disconnect_mgmt_nic(vm[:name], vm[:ip])
+          inline:     disconnect_mgmt_nic(vm_cfg[:name], vm_cfg[:ip], MGMT_SWITCH)
 
-        # Reboot the VM cleanly after NIC removal so the OS drops its
-        # Default Switch routes and settles on the lab IP only.
+        # Reboot so the VM OS drops Default Switch routes and settles on lab IP
         # Requires: vagrant plugin install vagrant-reload
         m.vm.provision :reload
 
-        # After reboot Vagrant can no longer reach the VM via NIC1.
-        # From this point all communication is via the static lab IP.
-        # We update winrm.host so Vagrant knows where to find it.
-        m.winrm.host = vm[:ip]
-
       end
 
-      # ── AUDIT-BOX (Kali) ────────────────────────────────────────────────────
-      if vm[:name] == "AUDIT-BOX"
+      # ── AUDIT-BOX (Kali) ───────────────────────────────────────────────────
+      if vm_cfg[:name] == "AUDIT-BOX"
 
         m.vm.communicator = "ssh"
+        # Vagrant connects via NIC1 (Default Switch DHCP) automatically
 
-        # Phase 1: set static lab IP on NIC2
+        # Phase 1: set static lab IP on NIC2 (runs inside AUDIT-BOX)
         m.vm.provision "shell",
-          name:       "Phase 1 – Set Static Lab IP",
-          inline:     linux_bootstrap(vm[:ip]),
+          name:       "Phase 1 - Set Static Lab IP",
+          inline:     linux_bootstrap(vm_cfg[:ip], PREFIX_LEN),
           privileged: true
 
-        # Phase 2: disconnect Default Switch NIC (host-side PowerShell)
+        # Phase 2: remove Default Switch NIC (runs on Windows host)
         m.vm.provision "shell",
-          name:       "Phase 2 – Disconnect Default Switch NIC",
+          name:       "Phase 2 - Disconnect Default Switch NIC",
           privileged: false,
-          inline:     disconnect_mgmt_nic(vm[:name], vm[:ip])
+          inline:     disconnect_mgmt_nic(vm_cfg[:name], vm_cfg[:ip], MGMT_SWITCH)
 
         # Reboot AUDIT-BOX to drop NIC1 routes
         m.vm.provision :reload
 
-        # Update SSH host to lab IP after reboot
-        m.ssh.host = vm[:ip]
-
-        # Phase 3: install Ansible inside AUDIT-BOX (now on lab network only)
+        # Phase 3: install Ansible (AUDIT-BOX is now on lab network only)
         m.vm.provision "shell",
-          name:       "Phase 3 – Install Ansible",
+          name:       "Phase 3 - Install Ansible",
           path:       "scripts/setup/bootstrap-audit-box.sh",
           privileged: true
 
-        # Phase 4: ansible_local runs from AUDIT-BOX over static lab IPs
+        # Phase 4: ansible_local -- Ansible runs FROM AUDIT-BOX over WinRM
+        # targeting all VMs on their static 10.10.10.x lab IPs
         m.vm.provision "ansible_local",
           playbook:          "ansible/playbooks/site.yml",
           inventory_path:    "ansible/inventory.yml",
@@ -375,7 +303,7 @@ Vagrant.configure("2") do |config|
           verbose:           "v",
           galaxy_role_file:  "ansible/requirements.yml",
           galaxy_roles_path: "/home/vagrant/.ansible/roles",
-          extra_vars: {
+          extra_vars:        {
             domain_name:             DOMAIN,
             domain_netbios:          NETBIOS,
             dc_primary_ip:           "10.10.10.10",
