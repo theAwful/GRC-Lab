@@ -40,7 +40,7 @@ MACHINES = [
   { name: "MEMBER-SERVER-02",    box: "gusztavvargadr/windows-server-2019-standard", ip: "10.10.10.21", ram: 4096, cpus: 2 },
   { name: "WORKSTATION-WIN10-01",box: "gusztavvargadr/windows-10-enterprise",        ip: "10.10.10.31", ram: 4096, cpus: 2 },
   { name: "WORKSTATION-WIN10-02",box: "gusztavvargadr/windows-10-enterprise",        ip: "10.10.10.32", ram: 4096, cpus: 2 },
-  { name: "WORKSTATION-WIN11",   box: "gusztavvargadr/windows-11-enterprise",        ip: "10.10.10.33", ram: 4096, cpus: 2 },
+  { name: "WORKSTATION-WIN11",   box: "gusztavvargadr/windows-11-22h2-enterprise",        ip: "10.10.10.33", ram: 4096, cpus: 2 },
   { name: "AUDIT-BOX",           box: "kalilinux/rolling",                           ip: "10.10.10.50", ram: 4096, cpus: 2 },
 ].freeze
 
