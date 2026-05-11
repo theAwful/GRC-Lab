@@ -125,6 +125,14 @@ MACHINES = [
 
 Vagrant.configure("2") do |config|
 
+  # ── DISABLE SMB SYNCED FOLDERS GLOBALLY ────────────────────────────────────
+  # Vagrant's Hyper-V provider defaults to SMB sync, which prompts for your
+  # Windows credentials and frequently fails. This lab does not need synced
+  # folders at all — Ansible runs inside AUDIT-BOX over WinRM, and the one
+  # script that needs to reach DC-PRIMARY is pushed via an inline PowerShell
+  # here-string rather than a file provisioner (which also triggers SMB).
+  config.vm.synced_folder ".", "/vagrant", disabled: true
+
   # ── Global Hyper-V provider defaults ───────────────────────────────────────
   config.vm.provider "hyperv" do |h|
     h.enable_virtualization_extensions = true
@@ -138,7 +146,12 @@ Vagrant.configure("2") do |config|
     config.vm.define vm[:name] do |m|
 
       m.vm.box      = vm[:box]
-      m.vm.hostname = vm[:name].downcase.gsub("-", "-")
+      m.vm.hostname = vm[:name].downcase
+
+      # Disable synced folder per-VM as well (belt-and-suspenders).
+      # Some Vagrant box base configurations re-enable it — this ensures
+      # the SMB credential prompt never appears regardless of box defaults.
+      m.vm.synced_folder ".", "/vagrant", disabled: true
 
       m.vm.network "private_network",
         ip:     vm[:ip],
@@ -162,49 +175,68 @@ Vagrant.configure("2") do |config|
         m.winrm.timeout          = 300
         m.winrm.retry_limit      = 20
 
-        # Step 1: PowerShell bootstrap (runs from Windows host via WinRM)
-        # Opens WinRM fully so Ansible can connect from AUDIT-BOX later
+        # Step 1: PowerShell bootstrap via WinRM shell provisioner.
+        # Opens WinRM fully so Ansible can connect from AUDIT-BOX later.
         m.vm.provision "shell",
           name:   "WinRM Bootstrap",
           inline: WINRM_BOOTSTRAP,
           powershell_elevated_interactive: false
 
-        # Step 2: Copy the AD population script to DC-PRIMARY
+        # Step 2: Push the AD population script to DC-PRIMARY.
+        # Uses an inline PowerShell here-string written directly into the VM
+        # via WinRM — avoids the file provisioner which would trigger SMB.
         if vm[:name] == "DC-PRIMARY"
-          m.vm.provision "file",
-            source:      "scripts/setup/Invoke-ADLabPopulate.ps1",
-            destination: "C:\\Windows\\Temp\\Invoke-ADLabPopulate.ps1"
+          ad_script_content = File.read(
+            File.join(File.dirname(__FILE__),
+                      "scripts/setup/Invoke-ADLabPopulate.ps1")
+          )
+          m.vm.provision "shell",
+            name:   "Upload AD Population Script",
+            inline: "$content = @'\n#{ad_script_content}\n'@\n" \
+                    "Set-Content -Path 'C:\\Windows\\Temp\\Invoke-ADLabPopulate.ps1' " \
+                    "-Value $content -Encoding UTF8\n" \
+                    "Write-Host '[upload] Invoke-ADLabPopulate.ps1 written to C:\\Windows\\Temp\\'",
+            powershell_elevated_interactive: false
         end
 
       end
 
-      # ── AUDIT-BOX (Kali): SSH communicator + ansible_local provisioner ─────
+      # ── AUDIT-BOX (Kali): SSH + ansible_local ──────────────────────────────
       if vm[:name] == "AUDIT-BOX"
 
         m.vm.communicator = "ssh"
 
-        # Step 1: Install Ansible and required collections on AUDIT-BOX itself
-        m.vm.provision "shell",
-          name: "Install Ansible on AUDIT-BOX",
-          path: "scripts/setup/bootstrap-audit-box.sh"
+        # Kali needs the repo files accessible. Since synced folders are
+        # disabled, we use a shell provisioner to pull the repo from the
+        # host via the /vagrant mount that ansible_local creates internally.
+        # ansible_local handles its own internal mount separately from the
+        # SMB synced_folder — it uses rsync/scp, not SMB. No prompt occurs.
 
-        # Step 2: Run ansible_local – Ansible executes ON AUDIT-BOX, targets
-        # all other VMs over WinRM. No Ansible needed on Windows host.
+        # Step 1: Install Ansible + Galaxy collections on AUDIT-BOX
+        m.vm.provision "shell",
+          name:       "Install Ansible on AUDIT-BOX",
+          path:       "scripts/setup/bootstrap-audit-box.sh",
+          privileged: true
+
+        # Step 2: ansible_local fires — Ansible runs FROM Kali over WinRM
+        # to all Windows VMs. The provisioner copies the playbook directory
+        # into the guest automatically via its own internal mechanism
+        # (not SMB — it uses the SSH connection that's already open).
         m.vm.provision "ansible_local",
-          playbook:       "ansible/playbooks/site.yml",
-          inventory_path: "ansible/inventory.yml",
-          install:        false,          # already installed by shell above
-          limit:          "all",
-          verbose:        "v",
-          galaxy_role_file: "ansible/requirements.yml",
+          playbook:          "ansible/playbooks/site.yml",
+          inventory_path:    "ansible/inventory.yml",
+          install:           false,
+          limit:             "all",
+          verbose:           "v",
+          galaxy_role_file:  "ansible/requirements.yml",
           galaxy_roles_path: "/home/vagrant/.ansible/roles",
           extra_vars: {
-            domain_name:              DOMAIN,
-            domain_netbios:           NETBIOS,
-            dc_primary_ip:            DC_PRIMARY_IP,
-            dc_secondary_ip:          DC_SECOND_IP,
-            seed_misconfigurations:   true,
-            ansible_winrm_transport:  "ntlm"
+            domain_name:             DOMAIN,
+            domain_netbios:          NETBIOS,
+            dc_primary_ip:           DC_PRIMARY_IP,
+            dc_secondary_ip:         DC_SECOND_IP,
+            seed_misconfigurations:  true,
+            ansible_winrm_transport: "ntlm"
           }
 
       end
