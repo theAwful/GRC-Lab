@@ -1,53 +1,49 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    Creates the GRC Lab Hyper-V switches.
+    Creates GRC-Lab-Switch and configures NAT so all VMs including AUDIT-BOX
+    get internet access through the host via 10.10.10.1.
 
-    Two switches are created:
-      1. GRC-Lab-Switch  (Internal) -- isolated lab network, 10.10.10.0/24
-                                       all VMs connect here for lab traffic
-                                       host is at 10.10.10.1
+.NOTES
+    This host appears to be a VM itself (VirtIO NIC detected), so an external
+    switch is not possible. NAT through the internal switch is the correct
+    approach for nested virtualization environments.
 
-      2. GRC-External-Switch (External, bridged to your Ethernet NIC)
-                                       AUDIT-BOX connects here to get a
-                                       real DHCP address from your router
-                                       and full internet access
-
-    This is the same as VMware's bridged networking -- the VM appears as
-    a real device on your LAN with internet access, no NAT or ICS needed.
-    Requires a wired Ethernet adapter (not WiFi).
+    All VMs use:
+      Gateway : 10.10.10.1  (this host)
+      DNS     : 8.8.8.8 during bootstrap, then 10.10.10.10 after DC promotion
 #>
 
-$LabSwitchName  = "GRC-Lab-Switch"
-$ExtSwitchName  = "GRC-External-Switch"
-$HostIP         = "10.10.10.1"
-$Prefix         = "10.10.10.0/24"
-$PrefixLen      = 24
+$SwitchName = "GRC-Lab-Switch"
+$NatName    = "GRC-Lab-NAT"
+$HostIP     = "10.10.10.1"
+$Prefix     = "10.10.10.0/24"
+$PrefixLen  = 24
 
 Write-Host ""
-Write-Host "=== GRC Lab - Hyper-V Switch Setup ===" -ForegroundColor Cyan
+Write-Host "=== GRC Lab - Hyper-V Switch + NAT Setup ===" -ForegroundColor Cyan
 Write-Host ""
 
-# =============================================================================
-# 1. GRC-Lab-Switch (Internal) -- lab-only isolated network
-# =============================================================================
-$existing = Get-VMSwitch -Name $LabSwitchName -ErrorAction SilentlyContinue
+# ── 1. Internal switch ────────────────────────────────────────────────────────
+$existing = Get-VMSwitch -Name $SwitchName -ErrorAction SilentlyContinue
 if ($existing) {
-    Write-Host "  [OK] Internal switch '$LabSwitchName' already exists." -ForegroundColor Green
+    Write-Host "  [OK] Switch '$SwitchName' already exists." -ForegroundColor Green
 } else {
-    New-VMSwitch -Name $LabSwitchName -SwitchType Internal | Out-Null
-    Write-Host "  [+] Internal switch '$LabSwitchName' created." -ForegroundColor Green
+    New-VMSwitch -Name $SwitchName -SwitchType Internal | Out-Null
+    Write-Host "  [+] Switch '$SwitchName' created." -ForegroundColor Green
 }
 
-# Assign host IP 10.10.10.1 on the lab switch adapter
-$adapter = Get-NetAdapter | Where-Object { $_.Name -like "*$LabSwitchName*" }
+# ── 2. Host IP 10.10.10.1 on the switch adapter ───────────────────────────────
+$adapter = Get-NetAdapter | Where-Object { $_.Name -like "*$SwitchName*" }
 if (-not $adapter) {
-    Write-Error "Cannot find adapter for '$LabSwitchName'"
+    Write-Error "Cannot find adapter for '$SwitchName'"
     exit 1
 }
+
 $existingIP = Get-NetIPAddress -InterfaceIndex $adapter.ifIndex `
     -AddressFamily IPv4 -ErrorAction SilentlyContinue |
     Where-Object { $_.IPAddress -eq $HostIP }
+
 if ($existingIP) {
     Write-Host "  [OK] Host IP $HostIP already assigned." -ForegroundColor Green
 } else {
@@ -59,69 +55,65 @@ if ($existingIP) {
     Write-Host "  [+] Host IP $HostIP/$PrefixLen assigned." -ForegroundColor Green
 }
 
-# =============================================================================
-# 2. GRC-External-Switch (External, bridged to Ethernet NIC)
-#    Gives AUDIT-BOX a real LAN IP + internet access -- same as VMware bridged
-# =============================================================================
-$existingExt = Get-VMSwitch -Name $ExtSwitchName -ErrorAction SilentlyContinue
-if ($existingExt) {
-    Write-Host "  [OK] External switch '$ExtSwitchName' already exists." -ForegroundColor Green
+# ── 3. NAT rule ───────────────────────────────────────────────────────────────
+$existingNat = Get-NetNat -Name $NatName -ErrorAction SilentlyContinue
+if ($existingNat) {
+    Write-Host "  [OK] NAT '$NatName' already exists." -ForegroundColor Green
 } else {
-    # Find the physical Ethernet adapter that has internet access
-    # Prefers adapters with a default gateway (i.e. internet-connected)
-    $physicalAdapters = Get-NetAdapter |
-        Where-Object {
-            $_.Status -eq 'Up' -and
-            $_.PhysicalMediaType -ne 'Unspecified' -and
-            $_.Name -notlike '*vEthernet*' -and
-            $_.Name -notlike '*Hyper-V*' -and
-            $_.Name -notlike '*Loopback*'
-        } | Sort-Object -Property { 
-            # Prefer adapters with a default gateway
-            $gw = (Get-NetRoute -InterfaceIndex $_.ifIndex -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue)
-            if ($gw) { 0 } else { 1 }
-        }
-
-    if (-not $physicalAdapters) {
-        Write-Error "No physical Ethernet adapters found. Cannot create external switch."
-        exit 1
-    }
-
-    # Show available adapters so user can confirm
-    Write-Host ""
-    Write-Host "  Available Ethernet adapters:" -ForegroundColor Cyan
-    $physicalAdapters | ForEach-Object {
-        $gw = (Get-NetRoute -InterfaceIndex $_.ifIndex -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue)
-        $hasInternet = if ($gw) { "(internet-connected)" } else { "" }
-        Write-Host "    - $($_.Name): $($_.InterfaceDescription) $hasInternet"
-    }
-
-    $selectedAdapter = $physicalAdapters | Select-Object -First 1
-    Write-Host ""
-    Write-Host "  Using: $($selectedAdapter.Name) ($($selectedAdapter.InterfaceDescription))" -ForegroundColor Yellow
-    Write-Host "  (Edit this script and set -NetAdapterName manually to choose a different adapter)"
-    Write-Host ""
-
-    New-VMSwitch -Name $ExtSwitchName `
-        -NetAdapterName $selectedAdapter.Name `
-        -AllowManagementOS $true | Out-Null
-    Write-Host "  [+] External switch '$ExtSwitchName' created on '$($selectedAdapter.Name)'." -ForegroundColor Green
+    New-NetNat -Name $NatName -InternalIPInterfaceAddressPrefix $Prefix | Out-Null
+    Write-Host "  [+] NAT '$NatName' created for $Prefix." -ForegroundColor Green
 }
 
-# =============================================================================
-# 3. Verify
-# =============================================================================
+# ── 4. IP forwarding (required for NAT to actually route packets) ─────────────
+$fwdKey  = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters"
+$current = (Get-ItemProperty -Path $fwdKey -Name IPEnableRouter -ErrorAction SilentlyContinue).IPEnableRouter
+if ($current -eq 1) {
+    Write-Host "  [OK] IP forwarding already enabled." -ForegroundColor Green
+} else {
+    Set-ItemProperty -Path $fwdKey -Name IPEnableRouter -Value 1
+    Write-Host "  [+] IP forwarding enabled." -ForegroundColor Green
+    Write-Host "      NOTE: Reboot the host for IP forwarding to take full effect." -ForegroundColor Yellow
+}
+
+# ── 5. Firewall rule to allow forwarded traffic ───────────────────────────────
+$fwRule = Get-NetFirewallRule -Name "GRC-Lab-Forward" -ErrorAction SilentlyContinue
+if ($fwRule) {
+    Write-Host "  [OK] Firewall forward rule already exists." -ForegroundColor Green
+} else {
+    New-NetFirewallRule `
+        -Name        "GRC-Lab-Forward" `
+        -DisplayName "GRC Lab - Allow Forwarded Traffic" `
+        -Direction   Inbound `
+        -Action      Allow `
+        -Protocol    Any | Out-Null
+    Write-Host "  [+] Firewall rule created." -ForegroundColor Green
+}
+
+# ── 6. Quick internet test from this host ────────────────────────────────────
 Write-Host ""
-Write-Host "=== Verification ===" -ForegroundColor Cyan
+Write-Host "  Testing internet from host..." -ForegroundColor Cyan
+try {
+    $r = Invoke-WebRequest -Uri "https://pypi.org" -UseBasicParsing -TimeoutSec 8 -ErrorAction Stop
+    Write-Host "  [OK] Host has internet access." -ForegroundColor Green
+} catch {
+    Write-Warning "  Host cannot reach pypi.org -- VMs may not get internet either."
+    Write-Warning "  Verify the parent hypervisor is passing internet through the VirtIO NIC."
+}
+
+# ── 7. Summary ────────────────────────────────────────────────────────────────
 Write-Host ""
-Write-Host "  GRC-Lab-Switch   : Internal | Host IP: $HostIP | All lab VMs connect here"
-Write-Host "  GRC-External-Switch : External | Bridged to Ethernet | AUDIT-BOX internet NIC"
+Write-Host "=== Summary ===" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "  VM network config:" -ForegroundColor Cyan
-Write-Host "    Windows VMs   -> GRC-Lab-Switch only"
-Write-Host "                     IP: 10.10.10.x, Mask: 255.255.255.0, GW: (none needed)"
-Write-Host "    AUDIT-BOX     -> GRC-Lab-Switch (10.10.10.50, static)"
-Write-Host "                  -> GRC-External-Switch (DHCP from your router)"
+Write-Host "  Switch      : $SwitchName (Internal)"
+Write-Host "  Host IP     : $HostIP (gateway for all VMs)"
+Write-Host "  NAT         : $NatName -> $Prefix"
+Write-Host "  IP Forward  : $((Get-ItemProperty -Path $fwdKey -Name IPEnableRouter).IPEnableRouter) (1=enabled)"
+Write-Host ""
+Write-Host "  Configure VMs with:" -ForegroundColor Cyan
+Write-Host "    IP      : 10.10.10.x"
+Write-Host "    Mask    : 255.255.255.0"
+Write-Host "    Gateway : 10.10.10.1"
+Write-Host "    DNS     : 8.8.8.8 (bootstrap), then 10.10.10.10 after DC promotion"
 Write-Host ""
 Write-Host "=== Done ===" -ForegroundColor Green
 Write-Host ""
