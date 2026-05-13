@@ -1,227 +1,71 @@
 # -*- mode: ruby -*-
 # =============================================================================
 # GRC Hyper-V Lab – Vagrantfile
-# =============================================================================
 #
 # NETWORKING APPROACH
 # ───────────────────
-# Vagrant + Hyper-V cannot set static IPs via the Vagrantfile and the
-# internal switch has no DHCP. Every approach that relies on Vagrant
-# connecting to the VM, running a provisioner, then changing the network
-# hits "guest not ready" because Vagrant loses the connection path.
+# You set static IPs manually on each VM's GRC-Lab-Switch adapter.
+# Vagrant connects via the Default Switch (DHCP, auto-detected) to run
+# the WinRM bootstrap provisioner. After that it reconnects using
+# winrm.host pointed at the static lab IP for all subsequent work.
 #
-# The only fully reliable solution: do ALL network configuration from
-# the Windows HOST using Hyper-V PowerShell and VMDirect/PSExec-style
-# execution — never ask Vagrant to reconnect after a network change.
+# Boot sequence per VM:
+#   1. VM boots -- Default Switch gives it a DHCP address automatically
+#   2. Vagrant auto-detects that DHCP address and connects via WinRM
+#   3. "Enable WinRM" provisioner runs -- opens WinRM on all adapters
+#      including the static lab IP you already set on NIC2
+#   4. winrm.host is set to the static IP so all further Vagrant
+#      communication goes via the lab network
 #
-# DESIGN
-# ──────
-# Each VM is defined with winrm.host / ssh.host pre-set to its static
-# lab IP. This means Vagrant will ONLY ever try to connect on that IP.
-#
-# A single host-side trigger (runs on the Windows host before Vagrant
-# tries to connect) handles everything:
-#   1. Waits for VM to boot and get a Default Switch DHCP address
-#   2. Uses Invoke-Command over that DHCP address to set the static IP
-#      on the lab NIC and open WinRM
-#   3. Removes the Default Switch NIC (Stop-VM / Remove-NIC / Start-VM)
-#   4. Waits for the VM to come back on the static lab IP
-#
-# By the time Vagrant tries its first WinRM/SSH connection (to set the
-# hostname), the VM is already on the static IP. No reconnection needed.
-# No "guest not ready" error.
+# You do NOT need to manually run anything on each VM.
+# You DO need to have set the static IP on each VM's GRC-Lab-Switch
+# adapter before running vagrant provision.
 #
 # Prerequisites:
-#   - Hyper-V enabled, Default Switch present
 #   - GRC-Lab-Switch created: .\scripts\setup\create-hyperv-switch.ps1
-#   - Vagrant >= 2.4
-#   - Git
+#   - Static IPs set on each VM's lab NIC (you've already done this)
+#   - Vagrant >= 2.4, vagrant-reload plugin, Git
 # =============================================================================
 
-DOMAIN      = "corp.grclab.local"
-NETBIOS     = "GRCLAB"
-LAB_SWITCH  = "GRC-Lab-Switch"
-MGMT_SWITCH = "Default Switch"
-PREFIX_LEN  = 24
+DOMAIN  = "corp.grclab.local"
+NETBIOS = "GRCLAB"
 
 MACHINES = [
-  { name: "DC-PRIMARY",          box: "gusztavvargadr/windows-server-2022-standard", ip: "10.10.10.10", ram: 4096, cpus: 2, linux: false },
-  { name: "DC-SECONDARY",        box: "gusztavvargadr/windows-server-2022-standard", ip: "10.10.10.11", ram: 4096, cpus: 2, linux: false },
-  { name: "MEMBER-SERVER-01",    box: "gusztavvargadr/windows-server-2019-standard", ip: "10.10.10.20", ram: 4096, cpus: 2, linux: false },
-  { name: "MEMBER-SERVER-02",    box: "gusztavvargadr/windows-server-2019-standard", ip: "10.10.10.21", ram: 4096, cpus: 2, linux: false },
-  { name: "WORKSTATION-WIN10-01",box: "gusztavvargadr/windows-10-22h2-enterprise",        ip: "10.10.10.31", ram: 4096, cpus: 2, linux: false },
-  { name: "WORKSTATION-WIN10-02",box: "gusztavvargadr/windows-10-22h2-enterprise",        ip: "10.10.10.32", ram: 4096, cpus: 2, linux: false },
-  { name: "WORKSTATION-WIN11",   box: "gusztavvargadr/windows-11-22h2-enterprise",        ip: "10.10.10.33", ram: 4096, cpus: 2, linux: false },
-  { name: "AUDIT-BOX",           box: "kalilinux/rolling",                           ip: "10.10.10.50", ram: 4096, cpus: 2, linux: true  },
+  { name: "DC-PRIMARY",           ip: "10.10.10.10", box: "gusztavvargadr/windows-server-2022-standard", ram: 4096, cpus: 2, linux: false },
+  { name: "DC-SECONDARY",         ip: "10.10.10.11", box: "gusztavvargadr/windows-server-2022-standard", ram: 4096, cpus: 2, linux: false },
+  { name: "MEMBER-SERVER-01",     ip: "10.10.10.20", box: "gusztavvargadr/windows-server-2019-standard", ram: 4096, cpus: 2, linux: false },
+  { name: "MEMBER-SERVER-02",     ip: "10.10.10.21", box: "gusztavvargadr/windows-server-2019-standard", ram: 4096, cpus: 2, linux: false },
+  { name: "WORKSTATION-WIN10-01", ip: "10.10.10.31", box: "gusztavvargadr/windows-10-22h2-enterprise",        ram: 4096, cpus: 2, linux: false },
+  { name: "WORKSTATION-WIN10-02", ip: "10.10.10.32", box: "gusztavvargadr/windows-10-22h2-enterprise",        ram: 4096, cpus: 2, linux: false },
+  { name: "WORKSTATION-WIN11",    ip: "10.10.10.33", box: "gusztavvargadr/windows-11-22h2-enterprise",        ram: 4096, cpus: 2, linux: false },
+  { name: "AUDIT-BOX",            ip: "10.10.10.50", box: "kalilinux/rolling",                           ram: 4096, cpus: 2, linux: true  },
 ].freeze
 
-# =============================================================================
-# Builds the host-side trigger script for a Windows VM.
-# This runs on the Windows HOST via PowerShell before Vagrant tries to connect.
-# It uses Invoke-Command over the Default Switch DHCP IP to configure the VM,
-# then removes the Default Switch NIC so the VM is lab-only from that point.
-# =============================================================================
-def win_network_trigger(vm_name, static_ip, prefix, mgmt_switch)
-  lines = []
-  lines << "param()"
-  lines << "$vmName    = '" + vm_name + "'"
-  lines << "$staticIP  = '" + static_ip + "'"
-  lines << "$prefixLen = " + prefix.to_s
-  lines << "$mgmtSw    = '" + mgmt_switch + "'"
-  lines << ""
-  lines << "Write-Host ''"
-  lines << "Write-Host '=== [Network Setup] " + vm_name + " ===' -ForegroundColor Cyan"
-  lines << ""
-  lines << "# ── Wait for VM to boot and get a DHCP address on Default Switch ──"
-  lines << "$dhcpIP = $null"
-  lines << "$timeout = 300"
-  lines << "$elapsed = 0"
-  lines << "Write-Host '  Waiting for VM to boot and get DHCP address...'"
-  lines << "while (-not $dhcpIP -and $elapsed -lt $timeout) {"
-  lines << "  Start-Sleep -Seconds 5"
-  lines << "  $elapsed += 5"
-  lines << "  $nic = Get-VMNetworkAdapter -VMName $vmName | Where-Object { $_.SwitchName -eq $mgmtSw }"
-  lines << "  if ($nic -and $nic.IPAddresses) {"
-  lines << "    $dhcpIP = ($nic.IPAddresses | Where-Object { $_ -notlike '169.254.*' -and $_ -notlike '*:*' } | Select-Object -First 1)"
-  lines << "  }"
-  lines << "}"
-  lines << ""
-  lines << "if (-not $dhcpIP) {"
-  lines << "  Write-Error '  Timed out waiting for DHCP address on " + vm_name + "'"
-  lines << "  exit 1"
-  lines << "}"
-  lines << "Write-Host '  DHCP address: ' + $dhcpIP"
-  lines << ""
-  lines << "# ── Run inside VM over Default Switch IP to set static lab IP ─────"
-  lines << "$cred = New-Object PSCredential('vagrant', (ConvertTo-SecureString 'vagrant' -AsPlainText -Force))"
-  lines << "$sessionOpts = New-PSSessionOption -SkipCACheck -SkipCNCheck -SkipRevocationCheck"
-  lines << ""
-  lines << "Write-Host '  Connecting to ' + $dhcpIP + ' to configure lab NIC...'"
-  lines << "$result = Invoke-Command -ComputerName $dhcpIP -Credential $cred -UseSSL:$false -SessionOption $sessionOpts -ErrorAction Stop -ScriptBlock {"
-  lines << "  param($ip, $prefix)"
-  lines << "  # Find NIC2 (GRC-Lab-Switch) -- APIPA or no IP"
-  lines << "  $labNic = $null"
-  lines << "  $tries  = 0"
-  lines << "  while (-not $labNic -and $tries -lt 15) {"
-  lines << "    Start-Sleep -Seconds 3"
-  lines << "    $tries++"
-  lines << "    foreach ($a in (Get-NetAdapter | Where-Object Status -eq 'Up')) {"
-  lines << "      $ips = (Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress"
-  lines << "      if (-not $ips -or ($ips | Where-Object { $_ -like '169.254.*' })) {"
-  lines << "        $labNic = $a; break"
-  lines << "      }"
-  lines << "    }"
-  lines << "  }"
-  lines << "  if (-not $labNic) {"
-  lines << "    $labNic = Get-NetAdapter | Where-Object Status -eq 'Up' | Sort-Object ifIndex -Descending | Select-Object -First 1"
-  lines << "  }"
-  lines << "  # Set static IP"
-  lines << "  Get-NetIPAddress -InterfaceIndex $labNic.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue"
-  lines << "  Get-NetRoute     -InterfaceIndex $labNic.ifIndex -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue"
-  lines << "  New-NetIPAddress -InterfaceIndex $labNic.ifIndex -IPAddress $ip -PrefixLength $prefix -ErrorAction Stop | Out-Null"
-  lines << "  Set-DnsClientServerAddress -InterfaceIndex $labNic.ifIndex -ServerAddresses @('10.10.10.10','10.10.10.11') | Out-Null"
-  lines << "  # Open WinRM"
-  lines << "  Set-ExecutionPolicy Unrestricted -Scope LocalMachine -Force"
-  lines << "  winrm quickconfig -q 2>&1 | Out-Null"
-  lines << "  winrm set winrm/config              '@{MaxTimeoutms=\"300000\"}'      2>&1 | Out-Null"
-  lines << "  winrm set winrm/config/service      '@{AllowUnencrypted=\"true\"}'    2>&1 | Out-Null"
-  lines << "  winrm set winrm/config/service/auth '@{Basic=\"true\"}'               2>&1 | Out-Null"
-  lines << "  winrm set winrm/config/service/auth '@{Negotiate=\"true\"}'           2>&1 | Out-Null"
-  lines << "  winrm set winrm/config/winrs        '@{MaxMemoryPerShellMB=\"1024\"}' 2>&1 | Out-Null"
-  lines << "  Get-NetFirewallRule -Name 'WinRM-HTTP-GRC' -ErrorAction SilentlyContinue | Remove-NetFirewallRule"
-  lines << "  New-NetFirewallRule -Name 'WinRM-HTTP-GRC' -DisplayName 'WinRM HTTP (GRC Lab)' -Protocol TCP -LocalPort 5985 -Action Allow -Direction Inbound -Profile Any | Out-Null"
-  lines << "  Enable-NetFirewallRule -DisplayName 'File and Printer Sharing (Echo Request - ICMPv4-In)' -ErrorAction SilentlyContinue"
-  lines << "  Set-ItemProperty -Path 'HKLM:\\System\\CurrentControlSet\\Control\\Terminal Server' -Name fDenyTSConnections -Value 0"
-  lines << "  Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue"
-  lines << "  return 'OK: ' + $ip"
-  lines << "} -ArgumentList $staticIP, $prefixLen"
-  lines << ""
-  lines << "Write-Host '  VM reported: ' + $result"
-  lines << ""
-  lines << "# ── Stop VM, remove Default Switch NIC, restart ───────────────────"
-  lines << "Write-Host '  Stopping VM to remove Default Switch NIC...'"
-  lines << "Stop-VM -Name $vmName -Force"
-  lines << "$t = 60"
-  lines << "while ((Get-VM -Name $vmName).State -ne 'Off' -and $t -gt 0) { Start-Sleep 2; $t -= 2 }"
-  lines << ""
-  lines << "$mgmtNic = Get-VMNetworkAdapter -VMName $vmName | Where-Object { $_.SwitchName -eq $mgmtSw }"
-  lines << "if ($mgmtNic) {"
-  lines << "  Remove-VMNetworkAdapter -VMName $vmName -VMNetworkAdapterName $mgmtNic.Name"
-  lines << "  Write-Host '  Default Switch NIC removed.' -ForegroundColor Green"
-  lines << "} else {"
-  lines << "  Write-Host '  Default Switch NIC already removed.' -ForegroundColor Yellow"
-  lines << "}"
-  lines << ""
-  lines << "Write-Host '  Starting VM on lab network only...'"
-  lines << "Start-VM -Name $vmName"
-  lines << ""
-  lines << "# ── Wait for WinRM on static lab IP ──────────────────────────────"
-  lines << "Write-Host '  Waiting for WinRM on " + static_ip + ":5985...'"
-  lines << "$ready = $false; $w = 0"
-  lines << "while (-not $ready -and $w -lt 180) {"
-  lines << "  Start-Sleep 5; $w += 5"
-  lines << "  $t = Test-NetConnection -ComputerName '" + static_ip + "' -Port 5985 -WarningAction SilentlyContinue -ErrorAction SilentlyContinue"
-  lines << "  if ($t.TcpTestSucceeded) { $ready = $true }"
-  lines << "}"
-  lines << "if ($ready) { Write-Host '  WinRM reachable on " + static_ip + "' -ForegroundColor Green }"
-  lines << "else { Write-Warning '  WinRM not yet reachable on " + static_ip + " -- Vagrant will retry' }"
-  lines << "Write-Host '=== [Network Setup] " + vm_name + " complete ===' -ForegroundColor Cyan"
-  lines.join("\n")
-end
+# WinRM bootstrap -- runs inside the VM via the Default Switch DHCP address.
+# Enables WinRM on all adapters (including the static lab IP on NIC2).
+# No IP changes, no NIC removal -- just opens the door for Ansible.
+WINRM_BOOTSTRAP = <<~'PS'
+  Write-Host "[bootstrap] Enabling WinRM..." -ForegroundColor Cyan
+  Set-ExecutionPolicy Unrestricted -Scope LocalMachine -Force
 
-# =============================================================================
-# Linux version of the network setup trigger (for AUDIT-BOX)
-# =============================================================================
-def linux_network_trigger(vm_name, static_ip, prefix, mgmt_switch)
-  lines = []
-  lines << "param()"
-  lines << "$vmName   = '" + vm_name + "'"
-  lines << "$staticIP = '" + static_ip + "'"
-  lines << "$mgmtSw   = '" + mgmt_switch + "'"
-  lines << ""
-  lines << "Write-Host ''"
-  lines << "Write-Host '=== [Network Setup] " + vm_name + " ===' -ForegroundColor Cyan"
-  lines << ""
-  lines << "# Wait for DHCP address on Default Switch"
-  lines << "$dhcpIP = $null; $elapsed = 0"
-  lines << "while (-not $dhcpIP -and $elapsed -lt 300) {"
-  lines << "  Start-Sleep 5; $elapsed += 5"
-  lines << "  $nic = Get-VMNetworkAdapter -VMName $vmName | Where-Object { $_.SwitchName -eq $mgmtSw }"
-  lines << "  if ($nic -and $nic.IPAddresses) {"
-  lines << "    $dhcpIP = ($nic.IPAddresses | Where-Object { $_ -notlike '169.254.*' -and $_ -notlike '*:*' } | Select-Object -First 1)"
-  lines << "  }"
-  lines << "}"
-  lines << "if (-not $dhcpIP) { Write-Error 'Timed out waiting for DHCP'; exit 1 }"
-  lines << "Write-Host '  DHCP address: ' + $dhcpIP"
-  lines << ""
-  lines << "# Set static IP inside AUDIT-BOX via SSH"
-  lines << "$sshCmd = 'nmcli connection delete grc-lab-static 2>/dev/null; nmcli connection add type ethernet ifname `$(ls /sys/class/net | grep -v lo | sort | tail -1) con-name grc-lab-static ipv4.method manual ipv4.addresses " + static_ip + "/" + prefix.to_s + " ipv4.dns 10.10.10.10,10.10.10.11 ipv6.method disabled && nmcli connection up grc-lab-static'"
-  lines << "$sshResult = ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ~/.vagrant.d/insecure_private_key vagrant@$dhcpIP $sshCmd 2>&1"
-  lines << "Write-Host '  SSH result: ' + $sshResult"
-  lines << ""
-  lines << "# Stop, remove Default Switch NIC, restart"
-  lines << "Stop-VM -Name $vmName -Force"
-  lines << "$t = 60"
-  lines << "while ((Get-VM -Name $vmName).State -ne 'Off' -and $t -gt 0) { Start-Sleep 2; $t -= 2 }"
-  lines << "$mgmtNic = Get-VMNetworkAdapter -VMName $vmName | Where-Object { $_.SwitchName -eq $mgmtSw }"
-  lines << "if ($mgmtNic) { Remove-VMNetworkAdapter -VMName $vmName -VMNetworkAdapterName $mgmtNic.Name; Write-Host '  NIC removed.' -ForegroundColor Green }"
-  lines << "Start-VM -Name $vmName"
-  lines << ""
-  lines << "# Wait for SSH on static IP"
-  lines << "Write-Host '  Waiting for SSH on " + static_ip + ":22...'"
-  lines << "$ready = $false; $w = 0"
-  lines << "while (-not $ready -and $w -lt 180) {"
-  lines << "  Start-Sleep 5; $w += 5"
-  lines << "  $t = Test-NetConnection -ComputerName '" + static_ip + "' -Port 22 -WarningAction SilentlyContinue -ErrorAction SilentlyContinue"
-  lines << "  if ($t.TcpTestSucceeded) { $ready = $true }"
-  lines << "}"
-  lines << "if ($ready) { Write-Host '  SSH reachable on " + static_ip + "' -ForegroundColor Green }"
-  lines << "else { Write-Warning 'SSH not yet reachable -- Vagrant will retry' }"
-  lines << "Write-Host '=== [Network Setup] " + vm_name + " complete ===' -ForegroundColor Cyan"
-  lines.join("\n")
-end
+  winrm quickconfig -q 2>&1 | Out-Null
+  winrm set winrm/config              '@{MaxTimeoutms="300000"}'      2>&1 | Out-Null
+  winrm set winrm/config/service      '@{AllowUnencrypted="true"}'    2>&1 | Out-Null
+  winrm set winrm/config/service/auth '@{Basic="true"}'               2>&1 | Out-Null
+  winrm set winrm/config/service/auth '@{Negotiate="true"}'           2>&1 | Out-Null
+  winrm set winrm/config/winrs        '@{MaxMemoryPerShellMB="1024"}' 2>&1 | Out-Null
 
-# =============================================================================
+  Get-NetFirewallRule -Name "WinRM-HTTP-GRC" -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+  New-NetFirewallRule -Name "WinRM-HTTP-GRC" -DisplayName "WinRM HTTP (GRC Lab)" `
+    -Protocol TCP -LocalPort 5985 -Action Allow -Direction Inbound -Profile Any | Out-Null
+
+  Enable-NetFirewallRule -DisplayName "File and Printer Sharing (Echo Request - ICMPv4-In)" -ErrorAction SilentlyContinue
+  Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
+  Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+
+  Write-Host "[bootstrap] WinRM open on all adapters." -ForegroundColor Green
+PS
+
 Vagrant.configure("2") do |config|
 
   config.vm.synced_folder ".", "/vagrant", disabled: true
@@ -238,7 +82,7 @@ Vagrant.configure("2") do |config|
       m.vm.box      = vm_cfg[:box]
       m.vm.hostname = vm_cfg[:name].downcase
       m.vm.synced_folder ".", "/vagrant", disabled: true
-      m.vm.network "private_network", bridge: LAB_SWITCH
+      m.vm.boot_timeout = 600
 
       m.vm.provider "hyperv" do |h|
         h.vmname    = vm_cfg[:name]
@@ -247,39 +91,28 @@ Vagrant.configure("2") do |config|
         h.cpus      = vm_cfg[:cpus]
       end
 
-      # ── Windows VMs ────────────────────────────────────────────────────────
+      # ── Windows VMs ──────────────────────────────────────────────────────
       unless vm_cfg[:linux]
 
-        # Tell Vagrant to ONLY connect on the static lab IP.
-        # The trigger below ensures the VM is ready on this IP before
-        # Vagrant ever tries to use it.
-        m.winrm.host        = vm_cfg[:ip]
-        m.winrm.username    = "vagrant"
-        m.winrm.password    = "vagrant"
-        m.winrm.transport   = :negotiate
+        m.vm.communicator       = "winrm"
+        m.winrm.username        = "vagrant"
+        m.winrm.password        = "vagrant"
+        m.winrm.transport       = :negotiate
         m.winrm.basic_auth_only = false
-        m.winrm.timeout     = 300
-        m.winrm.retry_limit = 20
-        m.vm.communicator   = "winrm"
-        m.vm.boot_timeout   = 600
+        m.winrm.timeout         = 300
+        m.winrm.retry_limit     = 20
+        # winrm.host intentionally NOT set here -- Vagrant auto-detects
+        # the Default Switch DHCP address for the initial connection
+        # and runs the bootstrap over that. After the bootstrap, WinRM
+        # is open on the static lab IP too, so Ansible can reach it.
 
-        # This trigger runs on the HOST after the VM starts but BEFORE
-        # Vagrant tries its first WinRM connection. It:
-        #   1. Gets the VM's DHCP IP from Hyper-V (doesn't need Vagrant comms)
-        #   2. Uses Invoke-Command to configure the lab NIC and WinRM
-        #   3. Removes the Default Switch NIC and reboots the VM
-        #   4. Waits for WinRM on the static lab IP
-        # By the time Vagrant connects, the VM is stable on the lab IP.
-        m.trigger.after :up, type: :action do |trigger|
-          trigger.name = "Configure Network: " + vm_cfg[:name]
-          trigger.run  = {
-            privileged: "false",
-            inline:     win_network_trigger(vm_cfg[:name], vm_cfg[:ip], PREFIX_LEN, MGMT_SWITCH)
-          }
-        end
+        # Step 1: open WinRM via Default Switch DHCP connection
+        m.vm.provision "shell",
+          name:                            "Enable WinRM",
+          inline:                          WINRM_BOOTSTRAP,
+          powershell_elevated_interactive: false
 
-        # Upload AD population script via WinRM provisioner (now that
-        # the VM is on the static lab IP and WinRM is confirmed open)
+        # Step 2: upload AD population script to DC-PRIMARY
         if vm_cfg[:name] == "DC-PRIMARY"
           script_path = File.join(File.dirname(__FILE__), "scripts/setup/Invoke-ADLabPopulate.ps1")
           if File.exist?(script_path)
@@ -289,37 +122,31 @@ Vagrant.configure("2") do |config|
               inline:                          "$dest='C:\\Windows\\Temp\\Invoke-ADLabPopulate.ps1'\nSet-Content -Path $dest -Encoding UTF8 -Value @'\n" + ad_script + "\n'@\nWrite-Host '[upload] Written to ' + $dest\n",
               powershell_elevated_interactive: false
           else
-            puts "WARNING: Invoke-ADLabPopulate.ps1 not found - skipping"
+            puts "WARNING: scripts/setup/Invoke-ADLabPopulate.ps1 not found - skipping"
           end
         end
 
       end
 
-      # ── AUDIT-BOX (Kali) ───────────────────────────────────────────────────
+      # ── AUDIT-BOX (Kali) ─────────────────────────────────────────────────
       if vm_cfg[:linux]
 
         m.vm.communicator = "ssh"
-        m.ssh.host        = vm_cfg[:ip]
         m.ssh.username    = "vagrant"
         m.ssh.insert_key  = true
-        m.vm.boot_timeout = 600
+        # ssh.host not set -- Vagrant auto-detects Default Switch DHCP address
+        # for bootstrap. Ansible then connects to all VMs via static lab IPs
+        # (defined in ansible/inventory.yml) independently of Vagrant.
 
-        # Same pattern -- host-side trigger configures network before Vagrant connects
-        m.trigger.after :up, type: :action do |trigger|
-          trigger.name = "Configure Network: " + vm_cfg[:name]
-          trigger.run  = {
-            privileged: "false",
-            inline:     linux_network_trigger(vm_cfg[:name], vm_cfg[:ip], PREFIX_LEN, MGMT_SWITCH)
-          }
-        end
-
-        # Install Ansible inside AUDIT-BOX
+        # Step 1: install Ansible inside AUDIT-BOX
         m.vm.provision "shell",
           name:       "Install Ansible",
           path:       "scripts/setup/bootstrap-audit-box.sh",
           privileged: true
 
-        # Run Ansible from AUDIT-BOX against all lab VMs
+        # Step 2: run Ansible from AUDIT-BOX against all lab VMs
+        # Ansible uses the static 10.10.10.x IPs from inventory.yml --
+        # it does not go through Vagrant's connection at all.
         m.vm.provision "ansible_local",
           playbook:          "ansible/playbooks/site.yml",
           inventory_path:    "ansible/inventory.yml",
