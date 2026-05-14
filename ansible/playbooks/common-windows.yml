@@ -1,0 +1,236 @@
+---
+# =============================================================================
+# GRC Hyper-V Lab - common-windows.yml
+# ansible/playbooks/common-windows.yml
+#
+# Applies baseline configuration to ALL Windows hosts before any role-specific
+# playbooks run. Called first from site.yml.
+# =============================================================================
+
+- name: "Common Windows Baseline"
+  hosts: all:!audit
+  gather_facts: no
+  vars:
+    ansible_winrm_operation_timeout_sec: 120
+    ansible_winrm_read_timeout_sec:      150
+
+  pre_tasks:
+    - name: Wait for WinRM to be available
+      ansible.windows.win_wait_for:
+        host:    "{{ ansible_host }}"
+        port:    5985
+        timeout: 300
+        delay:   10
+
+    - name: Confirm connectivity
+      ansible.windows.win_ping:
+
+  tasks:
+
+    # ── WinRM ───────────────────────────────────────────────────────────────
+    - name: Ensure WinRM service is running and auto-start
+      ansible.windows.win_service:
+        name:       WinRM
+        state:      started
+        start_mode: auto
+
+    - name: Set WinRM timeouts and memory limits
+      ansible.windows.win_powershell:
+        script: |
+          winrm set winrm/config              '@{MaxTimeoutms="300000"}'      2>&1 | Out-Null
+          winrm set winrm/config/service      '@{AllowUnencrypted="true"}'    2>&1 | Out-Null
+          winrm set winrm/config/service/auth '@{Basic="true"}'               2>&1 | Out-Null
+          winrm set winrm/config/service/auth '@{Negotiate="true"}'           2>&1 | Out-Null
+          winrm set winrm/config/winrs        '@{MaxMemoryPerShellMB="1024"}' 2>&1 | Out-Null
+          Write-Output "WinRM configured."
+
+    - name: Firewall rule - allow WinRM HTTP 5985
+      ansible.windows.win_firewall_rule:
+        name:      "WinRM-HTTP-GRC"
+        localport: "5985"
+        protocol:  tcp
+        direction: in
+        action:    allow
+        state:     present
+        enabled:   yes
+
+    - name: Firewall rule - allow WinRM HTTPS 5986
+      ansible.windows.win_firewall_rule:
+        name:      "WinRM-HTTPS-GRC"
+        localport: "5986"
+        protocol:  tcp
+        direction: in
+        action:    allow
+        state:     present
+        enabled:   yes
+
+    # ── PowerShell ──────────────────────────────────────────────────────────
+    - name: Set PowerShell execution policy to RemoteSigned
+      ansible.windows.win_powershell:
+        script: |
+          Set-ExecutionPolicy RemoteSigned -Scope LocalMachine -Force
+          Write-Output "Execution policy: $(Get-ExecutionPolicy -Scope LocalMachine)"
+
+    - name: Enable PowerShell remoting
+      ansible.windows.win_powershell:
+        script: |
+          Enable-PSRemoting -Force -SkipNetworkProfileCheck
+          Write-Output "PSRemoting enabled."
+
+    # ── Remote Desktop ──────────────────────────────────────────────────────
+    - name: Enable Remote Desktop
+      ansible.windows.win_regedit:
+        path: HKLM:\System\CurrentControlSet\Control\Terminal Server
+        name: fDenyTSConnections
+        data: 0
+        type: dword
+
+    - name: Firewall rule - allow RDP
+      ansible.windows.win_firewall_rule:
+        name:      "RDP-GRC"
+        localport: "3389"
+        protocol:  tcp
+        direction: in
+        action:    allow
+        state:     present
+        enabled:   yes
+
+    - name: Firewall rule - allow ICMP ping
+      ansible.windows.win_firewall_rule:
+        name:      "ICMP-GRC"
+        protocol:  icmpv4
+        direction: in
+        action:    allow
+        state:     present
+        enabled:   yes
+
+    # ── Time / Locale ───────────────────────────────────────────────────────
+    - name: Set timezone to Eastern Standard Time
+      community.windows.win_timezone:
+        timezone: Eastern Standard Time
+
+    - name: Sync time
+      ansible.windows.win_powershell:
+        script: |
+          w32tm /resync /force 2>&1 | Out-Null
+          Write-Output "Time synced: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+      ignore_errors: yes
+
+    # ── Network ─────────────────────────────────────────────────────────────
+    - name: Set DNS suffix search list
+      ansible.windows.win_powershell:
+        script: |
+          Set-DnsClientGlobalSetting `
+            -SuffixSearchList @("corp.grclab.local","grclab.local") `
+            -ErrorAction SilentlyContinue
+          Write-Output "DNS suffix list set."
+
+    - name: Disable IPv6 on all adapters
+      ansible.windows.win_powershell:
+        script: |
+          Get-NetAdapter | ForEach-Object {
+            Disable-NetAdapterBinding -Name $_.Name -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue
+          }
+          Write-Output "IPv6 disabled."
+      ignore_errors: yes
+
+    # ── Windows Update ──────────────────────────────────────────────────────
+    - name: Disable Windows Update automatic install (lab stability)
+      ansible.windows.win_regedit:
+        path: HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU
+        name: NoAutoUpdate
+        data: 1
+        type: dword
+
+    - name: Disable Windows Update auto-reboot
+      ansible.windows.win_regedit:
+        path: HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU
+        name: NoAutoRebootWithLoggedOnUsers
+        data: 1
+        type: dword
+
+    # ── Event Log sizes ─────────────────────────────────────────────────────
+    - name: Set Security event log to 256 MB
+      ansible.windows.win_powershell:
+        script: |
+          $log = Get-WinEvent -ListLog Security -ErrorAction SilentlyContinue
+          if ($log) {
+            $log.MaximumSizeInBytes = 268435456
+            $log.SaveChanges()
+            Write-Output "Security log: 256 MB"
+          }
+      ignore_errors: yes
+
+    - name: Set System event log to 64 MB
+      ansible.windows.win_powershell:
+        script: |
+          $log = Get-WinEvent -ListLog System -ErrorAction SilentlyContinue
+          if ($log) {
+            $log.MaximumSizeInBytes = 67108864
+            $log.SaveChanges()
+            Write-Output "System log: 64 MB"
+          }
+      ignore_errors: yes
+
+    - name: Set Application event log to 64 MB
+      ansible.windows.win_powershell:
+        script: |
+          $log = Get-WinEvent -ListLog Application -ErrorAction SilentlyContinue
+          if ($log) {
+            $log.MaximumSizeInBytes = 67108864
+            $log.SaveChanges()
+            Write-Output "Application log: 64 MB"
+          }
+      ignore_errors: yes
+
+    # ── Baseline registry hardening ─────────────────────────────────────────
+    - name: Disable AutoRun for all drives
+      ansible.windows.win_regedit:
+        path: HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer
+        name: NoDriveTypeAutoRun
+        data: 255
+        type: dword
+
+    - name: Set LM compatibility level to NTLMv2 only
+      ansible.windows.win_regedit:
+        path: HKLM:\SYSTEM\CurrentControlSet\Control\Lsa
+        name: LmCompatibilityLevel
+        data: 3
+        type: dword
+
+    - name: Screen lock after 15 minutes inactivity
+      ansible.windows.win_regedit:
+        path: HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System
+        name: InactivityTimeoutSecs
+        data: 900
+        type: dword
+
+    # ── RSAT tools on Server SKUs ───────────────────────────────────────────
+    - name: Install RSAT AD tools (Server only)
+      ansible.windows.win_feature:
+        name:
+          - RSAT-AD-PowerShell
+          - RSAT-AD-Tools
+          - RSAT-DNS-Server
+          - RSAT-GPMC
+        state: present
+      when: ansible_os_name is search("Server")
+      ignore_errors: yes
+
+    # ── Summary ─────────────────────────────────────────────────────────────
+    - name: Common baseline complete
+      ansible.windows.win_powershell:
+        script: |
+          $cs = Get-WmiObject Win32_ComputerSystem
+          $os = Get-WmiObject Win32_OperatingSystem
+          Write-Output "=== Common Baseline Applied ==="
+          Write-Output "  Host   : $($cs.Name)"
+          Write-Output "  OS     : $($os.Caption)"
+          Write-Output "  Domain : $($cs.Domain)"
+          Write-Output "  WinRM  : $(if ((Get-Service WinRM).Status -eq 'Running') {'Running'} else {'STOPPED'})"
+          Write-Output "  RDP    : $(if ((Get-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server').fDenyTSConnections -eq 0) {'Enabled'} else {'Disabled'})"
+      register: baseline_summary
+
+    - name: Show baseline summary
+      debug:
+        var: baseline_summary.output
