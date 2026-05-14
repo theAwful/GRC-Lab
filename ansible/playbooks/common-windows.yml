@@ -10,6 +10,11 @@
 - name: "Common Windows Baseline"
   hosts: all:!audit
   gather_facts: no
+
+  collections:
+    - ansible.windows
+    - community.windows
+
   vars:
     ansible_winrm_operation_timeout_sec: 120
     ansible_winrm_read_timeout_sec:      150
@@ -45,9 +50,9 @@
           Write-Output "WinRM configured."
 
     - name: Firewall rule - allow WinRM HTTP 5985
-      ansible.windows.win_firewall_rule:
+      community.windows.win_firewall_rule:
         name:      "WinRM-HTTP-GRC"
-        localport: "5985"
+        localport: 5985
         protocol:  tcp
         direction: in
         action:    allow
@@ -55,9 +60,9 @@
         enabled:   yes
 
     - name: Firewall rule - allow WinRM HTTPS 5986
-      ansible.windows.win_firewall_rule:
+      community.windows.win_firewall_rule:
         name:      "WinRM-HTTPS-GRC"
-        localport: "5986"
+        localport: 5986
         protocol:  tcp
         direction: in
         action:    allow
@@ -86,9 +91,9 @@
         type: dword
 
     - name: Firewall rule - allow RDP
-      ansible.windows.win_firewall_rule:
+      community.windows.win_firewall_rule:
         name:      "RDP-GRC"
-        localport: "3389"
+        localport: 3389
         protocol:  tcp
         direction: in
         action:    allow
@@ -96,7 +101,7 @@
         enabled:   yes
 
     - name: Firewall rule - allow ICMP ping
-      ansible.windows.win_firewall_rule:
+      community.windows.win_firewall_rule:
         name:      "ICMP-GRC"
         protocol:  icmpv4
         direction: in
@@ -207,30 +212,3 @@
 
     # ── RSAT tools on Server SKUs ───────────────────────────────────────────
     - name: Install RSAT AD tools (Server only)
-      ansible.windows.win_feature:
-        name:
-          - RSAT-AD-PowerShell
-          - RSAT-AD-Tools
-          - RSAT-DNS-Server
-          - RSAT-GPMC
-        state: present
-      when: ansible_os_name is search("Server")
-      ignore_errors: yes
-
-    # ── Summary ─────────────────────────────────────────────────────────────
-    - name: Common baseline complete
-      ansible.windows.win_powershell:
-        script: |
-          $cs = Get-WmiObject Win32_ComputerSystem
-          $os = Get-WmiObject Win32_OperatingSystem
-          Write-Output "=== Common Baseline Applied ==="
-          Write-Output "  Host   : $($cs.Name)"
-          Write-Output "  OS     : $($os.Caption)"
-          Write-Output "  Domain : $($cs.Domain)"
-          Write-Output "  WinRM  : $(if ((Get-Service WinRM).Status -eq 'Running') {'Running'} else {'STOPPED'})"
-          Write-Output "  RDP    : $(if ((Get-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server').fDenyTSConnections -eq 0) {'Enabled'} else {'Disabled'})"
-      register: baseline_summary
-
-    - name: Show baseline summary
-      debug:
-        var: baseline_summary.output
